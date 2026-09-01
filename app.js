@@ -79,15 +79,15 @@
   }
 
   function spinReels(spin) {
-    reelLeft.classList.toggle('is-spinning', spin);
-    reelRight.classList.toggle('is-spinning', spin);
+    if (reelLeft) reelLeft.classList.toggle('is-spinning', spin);
+    if (reelRight) reelRight.classList.toggle('is-spinning', spin);
   }
 
   function showLoadFailure() {
     const banner = document.getElementById('loadFailBanner');
     if (banner) banner.hidden = false;
     setLcdStatus('LOAD ERROR');
-    setFooter('Connection library failed to load — reload the page once you\u2019re back online.');
+    setFooter('Connection library failed to load — reload the page once you’re back online.');
     connectBtn.disabled = true;
   }
 
@@ -96,7 +96,7 @@
   }
 
   // =========================================================
-  // 1. Microphone capture
+  // 1. Microphone capture (Echo cancellation forced)
   // =========================================================
 
   async function getMicStream() {
@@ -105,8 +105,8 @@
       localStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
-          noiseSuppression: false,
-          autoGainControl: false,
+          noiseSuppression: true,
+          autoGainControl: true,
           channelCount: 1
         },
         video: false
@@ -123,7 +123,6 @@
 
   // =========================================================
   // 2. Audio graph — AnalyserNode (VU) + ScriptProcessor tap
-  //    (raw PCM, only pushed to pcmChunks while recording)
   // =========================================================
 
   function setupAudioGraph(stream) {
@@ -165,7 +164,7 @@
       const rms = Math.sqrt(sumSquares / dataArray.length);
       const level = Math.min(1, rms * 3.2);
       const deg = NEEDLE_MIN_DEG + level * (NEEDLE_MAX_DEG - NEEDLE_MIN_DEG);
-      vuNeedle.style.transform = 'rotate(' + deg + 'deg)';
+      if (vuNeedle) vuNeedle.style.transform = 'rotate(' + deg + 'deg)';
       requestAnimationFrame(tick);
     }
     tick();
@@ -225,7 +224,7 @@
       const countReq = store.count();
       countReq.onsuccess = () => {
         if (countReq.result > 0) {
-          setFooter('Found an unsaved take from last session — recovering it now\u2026');
+          setFooter('Found an unsaved take from last session — recovering it now…');
           recoverIndexedDbSession();
         }
       };
@@ -313,7 +312,7 @@
   }
 
   // =========================================================
-  // 5. PeerJS — room-code based connect, reconnection, acked sync
+  // 5. PeerJS — room-code connection & WebRTC handling
   // =========================================================
 
   function uniqueGuestPeerId() {
@@ -322,15 +321,11 @@
     return roomCode + '-guest-' + stamp + '-' + salt;
   }
 
-  function myFullPeerId() {
-    return isHost ? roomCode : uniqueGuestPeerId();
-  }
-
   function ensureRemoteAudioSafetyUi() {
     if (!remoteAudioWarningEl) {
       remoteAudioWarningEl = document.createElement('div');
       remoteAudioWarningEl.id = 'remoteAudioWarning';
-      remoteAudioWarningEl.textContent = 'Warning: wear headphones to avoid echo and feedback while talking.';
+      remoteAudioWarningEl.textContent = 'Warning: Wear headphones to prevent feedback and echo.';
       remoteAudioWarningEl.style.cssText = 'display:none; margin:10px auto 0; max-width:540px; padding:8px 12px; border-radius:999px; background:rgba(255, 182, 0, 0.12); color:#ffe08a; border:1px solid rgba(255,182,0,0.4); font-size:12px; font-weight:700; text-align:center; letter-spacing:0.04em; text-transform:uppercase;';
       document.body.appendChild(remoteAudioWarningEl);
     }
@@ -397,22 +392,17 @@
       if (err.type === 'unavailable-id') {
         if (!hostUnavailableRetryUsed) {
           hostUnavailableRetryUsed = true;
-          setFooter('Room is still busy or stale — retrying as host once more in a moment.');
-          if (reconnectTimer) clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(() => {
-            reconnectTimer = null;
-            if (roomCode) initPeerForRoom();
-          }, 1200);
+          becomeGuestAndConnect();
           return;
         }
         becomeGuestAndConnect();
       } else if (err.type === 'peer-unavailable') {
-        setFooter('No one\u2019s in that room yet — waiting, or double-check the code.');
-      } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed') {
+        setFooter('No one’s in that room yet — waiting, or double-check the code.');
+      } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
         scheduleReconnect();
       } else {
         console.error('Peer error', err);
-        setFooter('Connection hiccup (' + err.type + ') — retrying\u2026');
+        setFooter('Connection hiccup (' + err.type + ') — retrying…');
         scheduleReconnect();
       }
     });
@@ -425,7 +415,7 @@
         return;
       }
       if (reconnectTimer) return;
-      setFooter('Connection hiccup while joining — retrying guest link in a moment…');
+      setFooter('Connection dropped — retrying link in a moment…');
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         if (roomCode && !peer.destroyed) connectToHost();
@@ -440,8 +430,10 @@
     }
     if (peer) { peer.destroy(); peer = null; }
     isHost = false;
-    peer = new Peer(myFullPeerId(), { debug: 0 });
-    setFooter('Joining as guest from shared link…');
+    
+    const guestId = uniqueGuestPeerId();
+    peer = new Peer(guestId, { debug: 0 });
+    setFooter('Joining room as guest…');
 
     peer.on('open', (id) => {
       reconnectAttempts = 0;
@@ -453,10 +445,7 @@
     peer.on('error', (err) => {
       console.error('Guest peer error', err);
       if (err.type === 'peer-unavailable') {
-        // Host isn't there yet (or dropped) — keep retrying as guest rather
-        // than bouncing back to a host attempt, so two people joining at
-        // nearly the same moment don't flap roles back and forth.
-        setFooter('Waiting for co-host\u2019s room to open\u2026 retrying.');
+        setFooter('Waiting for host room to open… retrying.');
         reconnectAttempts++;
         const delay = Math.min(800 * Math.pow(1.5, reconnectAttempts), 8000);
         if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -465,7 +454,6 @@
           if (roomCode && !isHost) connectToHost();
         }, delay);
       } else if (err.type === 'unavailable-id') {
-        // Our own guest slot briefly collided (e.g. rapid rejoin) — just retry shortly.
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null;
@@ -478,7 +466,7 @@
     peer.on('disconnected', () => {
       setStatus('offline', 'RECONNECTING');
       if (reconnectTimer) return;
-      setFooter('Guest connection dropped — retrying link to the room…');
+      setFooter('Guest link dropped — retrying room connection…');
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         if (roomCode && !peer.destroyed) connectToHost();
@@ -488,13 +476,13 @@
 
   function onLocalPeerReady(id) {
     lcdMyId.textContent = 'room "' + roomCode + '"';
-    setLcdStatus(isHost ? 'ROOM OPEN' : 'JOINING\u2026');
+    setLcdStatus(isHost ? 'ROOM OPEN' : 'JOINING…');
     connectBtn.disabled = true;
     roomCodeField.disabled = true;
   }
 
   function connectToHost() {
-    setFooter('Joining your co-host\u2026');
+    setFooter('Connecting to co-host…');
     dataConn = peer.connect(roomCode, { reliable: true });
     wireDataConnection();
     getMicStream()
@@ -519,7 +507,7 @@
     const delay = Math.min(1000 * Math.pow(1.6, reconnectAttempts), 15000);
     setStatus('offline', 'RECONNECTING');
     setLcdStatus('RECONNECTING');
-    setFooter('Connection dropped — retrying in ' + Math.round(delay / 1000) + 's\u2026');
+    setFooter('Connection dropped — retrying in ' + Math.round(delay / 1000) + 's…');
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (roomCode) initPeerForRoom();
@@ -572,14 +560,14 @@
         el.id = 'remoteAudioEl';
         el.autoplay = true;
         el.muted = true;
-        el.volume = 0.18;
+        el.volume = 0.8;
         el.setAttribute('playsinline', '');
         el.style.display = 'none';
         document.body.appendChild(el);
       }
       el.srcObject = remoteStream;
+      // Force default state to muted to eliminate feedback loops
       el.muted = true;
-      el.volume = 0.18;
     });
     call.on('close', () => setFooter('Call ended.'));
     call.on('error', (err) => console.error('Media call error', err));
@@ -601,13 +589,13 @@
     url.searchParams.set('room', roomCode);
     window.history.replaceState({}, '', url);
 
-    setLcdStatus('CONNECTING\u2026');
-    setFooter('Opening room\u2026');
+    setLcdStatus('CONNECTING…');
+    setFooter('Opening room…');
     initPeerForRoom();
   }
 
   // =========================================================
-  // 6. Recording — real PCM capture, synced with ack + timeout warning
+  // 6. Recording Logic
   // =========================================================
 
   async function beginRecording(triggeredByPeer) {
@@ -625,7 +613,7 @@
       setLcdStatus('RECORDING');
       recordBtn.disabled = true;
       stopBtn.disabled = false;
-      setFooter(triggeredByPeer ? 'Co-host started the take — recording locally.' : 'Recording\u2026 waiting for co-host confirmation.');
+      setFooter(triggeredByPeer ? 'Co-host started the take — recording locally.' : 'Recording… waiting for co-host confirmation.');
 
       timerInterval = setInterval(() => {
         timeDisplay.textContent = formatTime(Date.now() - recordStartTime);
@@ -635,7 +623,7 @@
         dataConn.send('START_RECORD');
         clearTimeout(ackTimeout);
         ackTimeout = setTimeout(() => {
-          setFooter('\u26a0 No confirmation from co-host yet — check they\u2019re still connected.');
+          setFooter('⚠ No confirmation from co-host yet — check connection.');
         }, 2500);
       }
     } catch (err) {
@@ -652,20 +640,18 @@
     clearTimeout(ackTimeout);
 
     setStatus(dataConn && dataConn.open ? 'connected' : 'offline', dataConn && dataConn.open ? 'PEER LINKED' : 'OFFLINE');
-    setLcdStatus('SAVING\u2026');
+    setLcdStatus('SAVING…');
     recordBtn.disabled = false;
     stopBtn.disabled = true;
-    setFooter(triggeredByPeer ? 'Co-host stopped the take.' : 'Recording stopped — encoding WAV\u2026');
+    setFooter(triggeredByPeer ? 'Co-host stopped the take.' : 'Recording stopped — encoding WAV…');
 
     if (!triggeredByPeer && dataConn && dataConn.open) {
       dataConn.send('STOP_RECORD');
     }
 
-    // Let any in-flight onaudioprocess callback finish pushing its chunk
-    // before we read pcmChunks, so the last ~85ms of audio isn't dropped.
     setTimeout(() => {
       if (pcmChunks.length === 0) {
-        setFooter('Recording was too short to save — try holding the take a little longer.');
+        setFooter('Recording was too short to save.');
         setLcdStatus('EMPTY');
         clearIndexedDbSession();
         return;
@@ -698,7 +684,7 @@
   }
 
   // =========================================================
-  // Wire up UI events
+  // Wire UI events
   // =========================================================
 
   shareLinkBtn.addEventListener('click', async () => {
@@ -714,7 +700,7 @@
       const original = shareLinkBtn.textContent;
       shareLinkBtn.textContent = 'COPIED';
       setTimeout(() => (shareLinkBtn.textContent = original), 1200);
-      setFooter('Link copied — send it to your co-host, they just tap it to join.');
+      setFooter('Link copied — send it to your co-host to join.');
     } catch (e) {
       setFooter('Copy this link: ' + url.toString());
     }
@@ -745,7 +731,7 @@
   // =========================================================
 
   setStatus('offline', 'OFFLINE');
-  setLcdStatus('BOOTING\u2026');
+  setLcdStatus('BOOTING…');
   getMicStream().catch(() => {});
   checkForRecoverableSession();
 
@@ -753,19 +739,18 @@
   const sharedRoom = params.get('room');
   if (sharedRoom) {
     roomCodeField.value = sharedRoom;
-    setFooter('Room code loaded from link \u2014 joining automatically\u2026');
+    setFooter('Room code loaded from link — joining automatically…');
     waitForPeerLibThenJoin();
   } else {
     setFooter('Type a room code you both know, then hit Join Room.');
   }
 
   function waitForPeerLibThenJoin(attemptsLeft) {
-    if (attemptsLeft === undefined) attemptsLeft = 20; // ~4s total
+    if (attemptsLeft === undefined) attemptsLeft = 20;
     if (typeof Peer !== 'undefined') {
       if (sharedRoom) {
         roomCode = sharedRoom;
         roomCodeField.value = sharedRoom;
-        setFooter('Joining as guest via shared link…');
         becomeGuestAndConnect();
       } else {
         joinRoom();
