@@ -60,16 +60,28 @@
   const DB_NAME = 'dez-recorder';
   const DB_STORE = 'chunks';
 
+  // Default ICE servers to ensure reliable WebRTC traversal
+  const PEER_CONFIG = {
+    debug: 0,
+    config: {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' }
+      ]
+    }
+  };
+
   // =========================================================
   // Small helpers
   // =========================================================
 
   function setStatus(state, caption) {
-    statusLed.dataset.state = state;
-    statusLedCaption.textContent = caption;
+    if (statusLed) statusLed.dataset.state = state;
+    if (statusLedCaption) statusLedCaption.textContent = caption;
   }
-  function setLcdStatus(text) { lcdStatus.textContent = text; }
-  function setFooter(text) { footerMsg.textContent = text; }
+  function setLcdStatus(text) { if (lcdStatus) lcdStatus.textContent = text; }
+  function setFooter(text) { if (footerMsg) footerMsg.textContent = text; }
 
   function formatTime(ms) {
     const totalSec = Math.floor(ms / 1000);
@@ -88,7 +100,7 @@
     if (banner) banner.hidden = false;
     setLcdStatus('LOAD ERROR');
     setFooter('Connection library failed to load — reload the page once you’re back online.');
-    connectBtn.disabled = true;
+    if (connectBtn) connectBtn.disabled = true;
   }
 
   function slugifyRoomCode(raw) {
@@ -96,7 +108,7 @@
   }
 
   // =========================================================
-  // 1. Microphone capture (Echo cancellation forced)
+  // 1. Microphone capture
   // =========================================================
 
   async function getMicStream() {
@@ -199,7 +211,7 @@
       }
       lastPersistedIndex = pcmChunks.length;
     } catch (err) {
-      console.warn('IndexedDB persist failed (non-fatal)', err);
+      console.warn('IndexedDB persist failed', err);
     }
   }
 
@@ -210,7 +222,7 @@
       const tx = db.transaction(DB_STORE, 'readwrite');
       tx.objectStore(DB_STORE).clear();
     } catch (err) {
-      console.warn('IndexedDB clear failed (non-fatal)', err);
+      console.warn('IndexedDB clear failed', err);
     }
     lastPersistedIndex = 0;
   }
@@ -229,7 +241,7 @@
         }
       };
     } catch (err) {
-      console.warn('IndexedDB check failed (non-fatal)', err);
+      console.warn('IndexedDB check failed', err);
     }
   }
 
@@ -251,7 +263,7 @@
           if (all.length > 0) {
             const wavBlob = encodeWav(all, recoveredSampleRate);
             downloadBlob(wavBlob, true);
-            setFooter('Recovered a take from before the last crash/reload and saved it.');
+            setFooter('Recovered a take from before the last crash/reload.');
           }
           clearIndexedDbSession();
         }
@@ -262,7 +274,7 @@
   }
 
   // =========================================================
-  // 4. WAV encoding — real uncompressed 16-bit PCM
+  // 4. WAV encoding
   // =========================================================
 
   function encodeWav(float32Chunks, sr) {
@@ -312,7 +324,7 @@
   }
 
   // =========================================================
-  // 5. PeerJS — room-code connection & WebRTC handling
+  // 5. PeerJS — connection logic
   // =========================================================
 
   function uniqueGuestPeerId() {
@@ -351,18 +363,11 @@
 
   function teardownPeerState() {
     if (dataConn && typeof dataConn.close === 'function') {
-      try { dataConn.close(); } catch (err) { console.warn('Data conn close failed', err); }
+      try { dataConn.close(); } catch (err) {}
     }
-
     if (peer && !peer.destroyed) {
-      try { peer.destroy(); } catch (err) { console.warn('Peer destroy failed', err); }
+      try { peer.destroy(); } catch (err) {}
     }
-
-    if (localStream) {
-      localStream.getTracks().forEach((track) => track.stop());
-      localStream = null;
-    }
-
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
@@ -374,9 +379,10 @@
       showLoadFailure();
       return;
     }
-    if (peer) { peer.destroy(); peer = null; }
 
-    peer = new Peer(roomCode, { debug: 0 });
+    teardownPeerState();
+
+    peer = new Peer(roomCode, PEER_CONFIG);
 
     peer.on('open', (id) => {
       isHost = true;
@@ -390,19 +396,11 @@
 
     peer.on('error', (err) => {
       if (err.type === 'unavailable-id') {
-        if (!hostUnavailableRetryUsed) {
-          hostUnavailableRetryUsed = true;
-          becomeGuestAndConnect();
-          return;
-        }
         becomeGuestAndConnect();
       } else if (err.type === 'peer-unavailable') {
-        setFooter('No one’s in that room yet — waiting, or double-check the code.');
-      } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
-        scheduleReconnect();
+        setFooter('No host in room yet. Waiting for host…');
       } else {
-        console.error('Peer error', err);
-        setFooter('Connection hiccup (' + err.type + ') — retrying…');
+        console.warn('Peer error:', err.type);
         scheduleReconnect();
       }
     });
@@ -411,15 +409,10 @@
       setStatus('offline', 'RECONNECTING');
       setLcdStatus('RECONNECTING');
       if (isHost) {
-        if (!peer.destroyed) peer.reconnect();
+        if (peer && !peer.destroyed) peer.reconnect();
         return;
       }
-      if (reconnectTimer) return;
-      setFooter('Connection dropped — retrying link in a moment…');
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        if (roomCode && !peer.destroyed) connectToHost();
-      }, 1200);
+      scheduleReconnect();
     });
   }
 
@@ -428,11 +421,12 @@
       showLoadFailure();
       return;
     }
-    if (peer) { peer.destroy(); peer = null; }
+
+    teardownPeerState();
     isHost = false;
-    
+
     const guestId = uniqueGuestPeerId();
-    peer = new Peer(guestId, { debug: 0 });
+    peer = new Peer(guestId, PEER_CONFIG);
     setFooter('Joining room as guest…');
 
     peer.on('open', (id) => {
@@ -440,49 +434,34 @@
       onLocalPeerReady(id);
       connectToHost();
     });
+
     peer.on('call', handleIncomingCall);
     peer.on('connection', (conn) => { dataConn = conn; wireDataConnection(); });
+
     peer.on('error', (err) => {
-      console.error('Guest peer error', err);
       if (err.type === 'peer-unavailable') {
-        setFooter('Waiting for host room to open… retrying.');
-        reconnectAttempts++;
-        const delay = Math.min(800 * Math.pow(1.5, reconnectAttempts), 8000);
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          if (roomCode && !isHost) connectToHost();
-        }, delay);
-      } else if (err.type === 'unavailable-id') {
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          if (roomCode) becomeGuestAndConnect();
-        }, 1000);
+        setFooter('Waiting for room host… retrying.');
+        scheduleReconnect();
       } else {
         scheduleReconnect();
       }
     });
+
     peer.on('disconnected', () => {
       setStatus('offline', 'RECONNECTING');
-      if (reconnectTimer) return;
-      setFooter('Guest link dropped — retrying room connection…');
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        if (roomCode && !peer.destroyed) connectToHost();
-      }, 1200);
+      scheduleReconnect();
     });
   }
 
   function onLocalPeerReady(id) {
-    lcdMyId.textContent = 'room "' + roomCode + '"';
+    if (lcdMyId) lcdMyId.textContent = 'room "' + roomCode + '"';
     setLcdStatus(isHost ? 'ROOM OPEN' : 'JOINING…');
-    connectBtn.disabled = true;
-    roomCodeField.disabled = true;
+    if (connectBtn) connectBtn.disabled = true;
+    if (roomCodeField) roomCodeField.disabled = true;
   }
 
   function connectToHost() {
-    setFooter('Connecting to co-host…');
+    setFooter('Connecting to host…');
     dataConn = peer.connect(roomCode, { reliable: true });
     wireDataConnection();
     getMicStream()
@@ -490,7 +469,7 @@
         const call = peer.call(roomCode, stream);
         wireMediaCall(call);
       })
-      .catch(() => setFooter('Could not start voice call — mic permission required.'));
+      .catch(() => setFooter('Voice connection failed — microphone required.'));
   }
 
   async function handleIncomingCall(incomingCall) {
@@ -504,13 +483,16 @@
   function scheduleReconnect() {
     if (reconnectTimer) return;
     reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(1.6, reconnectAttempts), 15000);
+    const delay = Math.min(1200 * Math.pow(1.5, reconnectAttempts), 10000);
     setStatus('offline', 'RECONNECTING');
     setLcdStatus('RECONNECTING');
     setFooter('Connection dropped — retrying in ' + Math.round(delay / 1000) + 's…');
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (roomCode) initPeerForRoom();
+      if (roomCode) {
+        if (isHost) initPeerForRoom();
+        else becomeGuestAndConnect();
+      }
     }, delay);
   }
 
@@ -519,7 +501,7 @@
       setStatus('connected', 'PEER LINKED');
       setLcdStatus('PEER CONNECTED');
       setFooter('Co-host connected. Ready to record.');
-      recordBtn.disabled = false;
+      if (recordBtn) recordBtn.disabled = false;
     });
 
     dataConn.on('data', (msg) => {
@@ -537,12 +519,10 @@
     dataConn.on('close', () => {
       setStatus('offline', 'OFFLINE');
       setLcdStatus('PEER LEFT');
-      setFooter('Co-host disconnected — will reconnect automatically if they rejoin.');
+      setFooter('Co-host disconnected.');
     });
 
-    dataConn.on('error', (err) => {
-      console.warn('Data connection error', err);
-    });
+    dataConn.on('error', (err) => console.warn('Data channel error:', err));
   }
 
   function wireMediaCall(call) {
@@ -566,7 +546,6 @@
         document.body.appendChild(el);
       }
       el.srcObject = remoteStream;
-      // Force default state to muted to eliminate feedback loops
       el.muted = true;
     });
     call.on('close', () => setFooter('Call ended.'));
@@ -580,7 +559,7 @@
     }
     const code = slugifyRoomCode(roomCodeField.value);
     if (!code) {
-      setFooter('Enter a room code first — anything you and your co-host both know.');
+      setFooter('Enter a room code first.');
       return;
     }
     roomCode = code;
@@ -611,19 +590,19 @@
       spinReels(true);
       setStatus('recording', 'RECORDING');
       setLcdStatus('RECORDING');
-      recordBtn.disabled = true;
-      stopBtn.disabled = false;
-      setFooter(triggeredByPeer ? 'Co-host started the take — recording locally.' : 'Recording… waiting for co-host confirmation.');
+      if (recordBtn) recordBtn.disabled = true;
+      if (stopBtn) stopBtn.disabled = false;
+      setFooter(triggeredByPeer ? 'Co-host started recording locally.' : 'Recording… waiting for confirmation.');
 
       timerInterval = setInterval(() => {
-        timeDisplay.textContent = formatTime(Date.now() - recordStartTime);
+        if (timeDisplay) timeDisplay.textContent = formatTime(Date.now() - recordStartTime);
       }, 250);
 
       if (!triggeredByPeer && dataConn && dataConn.open) {
         dataConn.send('START_RECORD');
         clearTimeout(ackTimeout);
         ackTimeout = setTimeout(() => {
-          setFooter('⚠ No confirmation from co-host yet — check connection.');
+          setFooter('⚠ No confirmation from co-host yet.');
         }, 2500);
       }
     } catch (err) {
@@ -641,8 +620,8 @@
 
     setStatus(dataConn && dataConn.open ? 'connected' : 'offline', dataConn && dataConn.open ? 'PEER LINKED' : 'OFFLINE');
     setLcdStatus('SAVING…');
-    recordBtn.disabled = false;
-    stopBtn.disabled = true;
+    if (recordBtn) recordBtn.disabled = false;
+    if (stopBtn) stopBtn.disabled = true;
     setFooter(triggeredByPeer ? 'Co-host stopped the take.' : 'Recording stopped — encoding WAV…');
 
     if (!triggeredByPeer && dataConn && dataConn.open) {
@@ -678,41 +657,45 @@
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-    setFooter('Saved ' + filename + ' to your downloads.');
+    setFooter('Saved ' + filename + ' to downloads.');
     setLcdStatus('SAVED');
-    timeDisplay.textContent = '00:00';
+    if (timeDisplay) timeDisplay.textContent = '00:00';
   }
 
   // =========================================================
-  // Wire UI events
+  // Event Listeners
   // =========================================================
 
-  shareLinkBtn.addEventListener('click', async () => {
-    const code = slugifyRoomCode(roomCodeField.value);
-    if (!code) {
-      setFooter('Type a room code first, then share the link.');
-      return;
-    }
-    const url = new URL(window.location.href);
-    url.searchParams.set('room', code);
-    try {
-      await navigator.clipboard.writeText(url.toString());
-      const original = shareLinkBtn.textContent;
-      shareLinkBtn.textContent = 'COPIED';
-      setTimeout(() => (shareLinkBtn.textContent = original), 1200);
-      setFooter('Link copied — send it to your co-host to join.');
-    } catch (e) {
-      setFooter('Copy this link: ' + url.toString());
-    }
-  });
+  if (shareLinkBtn) {
+    shareLinkBtn.addEventListener('click', async () => {
+      const code = slugifyRoomCode(roomCodeField.value);
+      if (!code) {
+        setFooter('Type a room code first.');
+        return;
+      }
+      const url = new URL(window.location.href);
+      url.searchParams.set('room', code);
+      try {
+        await navigator.clipboard.writeText(url.toString());
+        const original = shareLinkBtn.textContent;
+        shareLinkBtn.textContent = 'COPIED';
+        setTimeout(() => (shareLinkBtn.textContent = original), 1200);
+        setFooter('Link copied to clipboard.');
+      } catch (e) {
+        setFooter('Copy this link: ' + url.toString());
+      }
+    });
+  }
 
-  connectBtn.addEventListener('click', joinRoom);
-  roomCodeField.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') joinRoom();
-  });
+  if (connectBtn) connectBtn.addEventListener('click', joinRoom);
+  if (roomCodeField) {
+    roomCodeField.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') joinRoom();
+    });
+  }
 
-  recordBtn.addEventListener('click', () => beginRecording(false));
-  stopBtn.addEventListener('click', () => finishRecording(false));
+  if (recordBtn) recordBtn.addEventListener('click', () => beginRecording(false));
+  if (stopBtn) stopBtn.addEventListener('click', () => finishRecording(false));
 
   window.addEventListener('beforeunload', (e) => {
     teardownPeerState();
@@ -722,12 +705,10 @@
     }
   });
 
-  window.addEventListener('pagehide', () => {
-    teardownPeerState();
-  });
+  window.addEventListener('pagehide', teardownPeerState);
 
   // =========================================================
-  // Boot
+  // Boot sequence
   // =========================================================
 
   setStatus('offline', 'OFFLINE');
@@ -737,20 +718,12 @@
 
   const params = new URLSearchParams(window.location.search);
   const sharedRoom = params.get('room');
-  if (sharedRoom) {
-    roomCodeField.value = sharedRoom;
-    setFooter('Room code loaded from link — joining automatically…');
-    waitForPeerLibThenJoin();
-  } else {
-    setFooter('Type a room code you both know, then hit Join Room.');
-  }
 
-  function waitForPeerLibThenJoin(attemptsLeft) {
-    if (attemptsLeft === undefined) attemptsLeft = 20;
+  function waitForPeerLibThenJoin(attemptsLeft = 20) {
     if (typeof Peer !== 'undefined') {
       if (sharedRoom) {
         roomCode = sharedRoom;
-        roomCodeField.value = sharedRoom;
+        if (roomCodeField) roomCodeField.value = sharedRoom;
         becomeGuestAndConnect();
       } else {
         joinRoom();
@@ -762,6 +735,14 @@
       return;
     }
     setTimeout(() => waitForPeerLibThenJoin(attemptsLeft - 1), 200);
+  }
+
+  if (sharedRoom) {
+    if (roomCodeField) roomCodeField.value = sharedRoom;
+    setFooter('Room code loaded from URL — joining automatically…');
+    waitForPeerLibThenJoin();
+  } else {
+    setFooter('Type a room code and press Join Room.');
   }
 
 })();
