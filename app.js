@@ -38,6 +38,9 @@
   let reconnectAttempts = 0;
   let reconnectTimer = null;
   let ackTimeout = null;
+  let hostUnavailableRetryUsed = false;
+  let remoteAudioToggleBtn = null;
+  let remoteAudioWarningEl = null;
 
   let isRecording = false;
   let recordStartTime = 0;
@@ -317,11 +320,60 @@
     return isHost ? roomCode : (roomCode + '-guest');
   }
 
+  function ensureRemoteAudioSafetyUi() {
+    if (!remoteAudioWarningEl) {
+      remoteAudioWarningEl = document.createElement('div');
+      remoteAudioWarningEl.id = 'remoteAudioWarning';
+      remoteAudioWarningEl.textContent = 'Warning: wear headphones to avoid echo and feedback while talking.';
+      remoteAudioWarningEl.style.cssText = 'display:none; margin:10px auto 0; max-width:540px; padding:8px 12px; border-radius:999px; background:rgba(255, 182, 0, 0.12); color:#ffe08a; border:1px solid rgba(255,182,0,0.4); font-size:12px; font-weight:700; text-align:center; letter-spacing:0.04em; text-transform:uppercase;';
+      document.body.appendChild(remoteAudioWarningEl);
+    }
+
+    if (!remoteAudioToggleBtn) {
+      remoteAudioToggleBtn = document.createElement('button');
+      remoteAudioToggleBtn.id = 'remoteAudioToggle';
+      remoteAudioToggleBtn.type = 'button';
+      remoteAudioToggleBtn.textContent = 'Unmute co-host audio';
+      remoteAudioToggleBtn.style.cssText = 'display:none; margin:10px auto 0; padding:8px 14px; border:none; border-radius:999px; cursor:pointer; background:#2ce0a2; color:#0f172a; font-weight:700;';
+      remoteAudioToggleBtn.addEventListener('click', () => {
+        const remoteEl = document.getElementById('remoteAudioEl');
+        if (!remoteEl) return;
+        remoteEl.muted = !remoteEl.muted;
+        remoteAudioToggleBtn.textContent = remoteEl.muted ? 'Unmute co-host audio' : 'Mute co-host audio';
+        remoteAudioToggleBtn.style.background = remoteEl.muted ? '#2ce0a2' : '#ffd166';
+      });
+      document.body.appendChild(remoteAudioToggleBtn);
+    }
+
+    return { remoteAudioWarningEl, remoteAudioToggleBtn };
+  }
+
+  function teardownPeerState() {
+    if (dataConn && typeof dataConn.close === 'function') {
+      try { dataConn.close(); } catch (err) { console.warn('Data conn close failed', err); }
+    }
+
+    if (peer && !peer.destroyed) {
+      try { peer.destroy(); } catch (err) { console.warn('Peer destroy failed', err); }
+    }
+
+    if (localStream) {
+      localStream.getTracks().forEach((track) => track.stop());
+      localStream = null;
+    }
+
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
   function initPeerForRoom() {
     if (typeof Peer === 'undefined') {
       showLoadFailure();
       return;
     }
+    hostUnavailableRetryUsed = false;
     if (peer) { peer.destroy(); peer = null; }
 
     peer = new Peer(roomCode, { debug: 0 });
@@ -338,6 +390,16 @@
 
     peer.on('error', (err) => {
       if (err.type === 'unavailable-id') {
+        if (!hostUnavailableRetryUsed) {
+          hostUnavailableRetryUsed = true;
+          setFooter('Room is still busy or stale — retrying as host once more in a moment.');
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            if (roomCode) initPeerForRoom();
+          }, 1200);
+          return;
+        }
         becomeGuestAndConnect();
       } else if (err.type === 'peer-unavailable') {
         setFooter('No one\u2019s in that room yet — waiting, or double-check the code.');
@@ -478,16 +540,26 @@
   function wireMediaCall(call) {
     mediaCall = call;
     call.on('stream', (remoteStream) => {
+      const { remoteAudioWarningEl: warningEl, remoteAudioToggleBtn: toggleBtn } = ensureRemoteAudioSafetyUi();
+      warningEl.style.display = 'block';
+      toggleBtn.style.display = 'inline-block';
+      toggleBtn.textContent = 'Unmute co-host audio';
+      toggleBtn.style.background = '#2ce0a2';
+
       let el = document.getElementById('remoteAudioEl');
       if (!el) {
         el = document.createElement('audio');
         el.id = 'remoteAudioEl';
         el.autoplay = true;
+        el.muted = true;
+        el.volume = 0.18;
         el.setAttribute('playsinline', '');
         el.style.display = 'none';
         document.body.appendChild(el);
       }
       el.srcObject = remoteStream;
+      el.muted = true;
+      el.volume = 0.18;
     });
     call.on('close', () => setFooter('Call ended.'));
     call.on('error', (err) => console.error('Media call error', err));
@@ -636,10 +708,15 @@
   stopBtn.addEventListener('click', () => finishRecording(false));
 
   window.addEventListener('beforeunload', (e) => {
+    teardownPeerState();
     if (isRecording) {
       e.preventDefault();
       e.returnValue = '';
     }
+  });
+
+  window.addEventListener('pagehide', () => {
+    teardownPeerState();
   });
 
   // =========================================================
