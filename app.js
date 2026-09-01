@@ -38,8 +38,6 @@
   let reconnectAttempts = 0;
   let reconnectTimer = null;
   let ackTimeout = null;
-  let remoteAudioToggleBtn = null;
-  let remoteAudioWarningEl = null;
 
   let isRecording = false;
   let recordStartTime = 0;
@@ -94,34 +92,24 @@
     return raw.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
   }
 
-  async function ensureAudioReady() {
-    if (audioCtx && audioCtx.state === 'suspended') {
-      await audioCtx.resume();
-    }
-  }
-
   // =========================================================
-  // 1. Microphone capture (Echo & Noise Suppression Enabled)
+  // 1. Microphone capture
   // =========================================================
 
   async function getMicStream() {
-    if (localStream) {
-      await ensureAudioReady();
-      return localStream;
-    }
+    if (localStream) return localStream;
     try {
       localStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
+          noiseSuppression: false,
+          autoGainControl: false,
           channelCount: 1
         },
         video: false
       });
       setFooter('Mic ready. Type a room code to connect.');
       setupAudioGraph(localStream);
-      await ensureAudioReady();
       return localStream;
     } catch (err) {
       console.error('getUserMedia failed', err);
@@ -132,6 +120,7 @@
 
   // =========================================================
   // 2. Audio graph — AnalyserNode (VU) + ScriptProcessor tap
+  //    (raw PCM, only pushed to pcmChunks while recording)
   // =========================================================
 
   function setupAudioGraph(stream) {
@@ -144,6 +133,7 @@
     analyser.fftSize = 512;
     analyser.smoothingTimeConstant = 0.6;
     sourceNode.connect(analyser);
+    runVuLoop();
 
     const bufferSize = 4096;
     processorNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
@@ -158,15 +148,11 @@
     silentGain.gain.value = 0;
     processorNode.connect(silentGain);
     silentGain.connect(audioCtx.destination);
-
-    runVuLoop();
   }
 
   function runVuLoop() {
-    if (!analyser) return;
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     function tick() {
-      if (!analyser) return;
       analyser.getByteTimeDomainData(dataArray);
       let sumSquares = 0;
       for (let i = 0; i < dataArray.length; i++) {
@@ -324,39 +310,11 @@
   }
 
   // =========================================================
-  // 5. PeerJS — Original Restored Connection Architecture
+  // 5. PeerJS — room-code based connect, reconnection, acked sync
   // =========================================================
 
   function myFullPeerId() {
     return isHost ? roomCode : (roomCode + '-guest');
-  }
-
-  function ensureRemoteAudioSafetyUi() {
-    if (!remoteAudioWarningEl) {
-      remoteAudioWarningEl = document.createElement('div');
-      remoteAudioWarningEl.id = 'remoteAudioWarning';
-      remoteAudioWarningEl.textContent = 'Warning: Wear headphones to prevent feedback and echo.';
-      remoteAudioWarningEl.style.cssText = 'display:none; margin:10px auto 0; max-width:540px; padding:8px 12px; border-radius:999px; background:rgba(255, 182, 0, 0.12); color:#ffe08a; border:1px solid rgba(255,182,0,0.4); font-size:12px; font-weight:700; text-align:center; letter-spacing:0.04em; text-transform:uppercase;';
-      document.body.appendChild(remoteAudioWarningEl);
-    }
-
-    if (!remoteAudioToggleBtn) {
-      remoteAudioToggleBtn = document.createElement('button');
-      remoteAudioToggleBtn.id = 'remoteAudioToggle';
-      remoteAudioToggleBtn.type = 'button';
-      remoteAudioToggleBtn.textContent = 'Unmute co-host audio';
-      remoteAudioToggleBtn.style.cssText = 'display:none; margin:10px auto 0; padding:8px 14px; border:none; border-radius:999px; cursor:pointer; background:#2ce0a2; color:#0f172a; font-weight:700;';
-      remoteAudioToggleBtn.onclick = () => {
-        const remoteEl = document.getElementById('remoteAudioEl');
-        if (!remoteEl) return;
-        remoteEl.muted = !remoteEl.muted;
-        remoteAudioToggleBtn.textContent = remoteEl.muted ? 'Unmute co-host audio' : 'Mute co-host audio';
-        remoteAudioToggleBtn.style.background = remoteEl.muted ? '#2ce0a2' : '#ffd166';
-      };
-      document.body.appendChild(remoteAudioToggleBtn);
-    }
-
-    return { remoteAudioWarningEl, remoteAudioToggleBtn };
   }
 
   function initPeerForRoom() {
@@ -418,6 +376,9 @@
     peer.on('error', (err) => {
       console.error('Guest peer error', err);
       if (err.type === 'peer-unavailable') {
+        // Host isn't there yet (or dropped) — keep retrying as guest rather
+        // than bouncing back to a host attempt, so two people joining at
+        // nearly the same moment don't flap roles back and forth.
         setFooter('Waiting for co-host\u2019s room to open\u2026 retrying.');
         reconnectAttempts++;
         const delay = Math.min(800 * Math.pow(1.5, reconnectAttempts), 8000);
@@ -427,6 +388,7 @@
           if (roomCode && !isHost) connectToHost();
         }, delay);
       } else if (err.type === 'unavailable-id') {
+        // Our own guest slot briefly collided (e.g. rapid rejoin) — just retry shortly.
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null;
@@ -449,31 +411,24 @@
     roomCodeField.disabled = true;
   }
 
-  async function connectToHost() {
-    setFooter('Joining your co-host…');
+  function connectToHost() {
+    setFooter('Joining your co-host\u2026');
     dataConn = peer.connect(roomCode, { reliable: true });
     wireDataConnection();
-    try {
-      const stream = await getMicStream();
-      await ensureAudioReady();
-      const call = peer.call(roomCode, stream);
-      wireMediaCall(call);
-    } catch (e) {
-      setFooter('Could not start voice call — mic permission required.');
-    }
+    getMicStream()
+      .then((stream) => {
+        const call = peer.call(roomCode, stream);
+        wireMediaCall(call);
+      })
+      .catch(() => setFooter('Could not start voice call — mic permission required.'));
   }
 
   async function handleIncomingCall(incomingCall) {
-    try {
-      const stream = localStream || await getMicStream();
-      await ensureAudioReady();
-      incomingCall.answer(stream);
-      wireMediaCall(incomingCall);
-    } catch (e) {
-      console.warn('Could not answer incoming call cleanly', e);
-      incomingCall.answer(new MediaStream());
-      wireMediaCall(incomingCall);
-    }
+    let stream;
+    try { stream = await getMicStream(); }
+    catch (e) { stream = new MediaStream(); }
+    incomingCall.answer(stream);
+    wireMediaCall(incomingCall);
   }
 
   function scheduleReconnect() {
@@ -523,31 +478,22 @@
   function wireMediaCall(call) {
     mediaCall = call;
     call.on('stream', (remoteStream) => {
-      const { remoteAudioWarningEl: warningEl, remoteAudioToggleBtn: toggleBtn } = ensureRemoteAudioSafetyUi();
-      warningEl.style.display = 'block';
-      toggleBtn.style.display = 'inline-block';
-      toggleBtn.textContent = 'Unmute co-host audio';
-      toggleBtn.style.background = '#2ce0a2';
-
       let el = document.getElementById('remoteAudioEl');
       if (!el) {
         el = document.createElement('audio');
         el.id = 'remoteAudioEl';
         el.autoplay = true;
-        el.muted = true; // Prevents audio loop by default
-        el.volume = 0.8;
         el.setAttribute('playsinline', '');
         el.style.display = 'none';
         document.body.appendChild(el);
       }
       el.srcObject = remoteStream;
-      el.muted = true; // Safeguard against automatic audio feedback
     });
     call.on('close', () => setFooter('Call ended.'));
     call.on('error', (err) => console.error('Media call error', err));
   }
 
-  async function joinRoom() {
+  function joinRoom() {
     if (typeof Peer === 'undefined') {
       showLoadFailure();
       return;
@@ -562,21 +508,13 @@
     url.searchParams.set('room', roomCode);
     window.history.replaceState({}, '', url);
 
-    try {
-      await getMicStream();
-      await ensureAudioReady();
-    } catch (e) {
-      setFooter('Mic permission required before connecting.');
-      return;
-    }
-
     setLcdStatus('CONNECTING\u2026');
     setFooter('Opening room\u2026');
     initPeerForRoom();
   }
 
   // =========================================================
-  // 6. Recording
+  // 6. Recording — real PCM capture, synced with ack + timeout warning
   // =========================================================
 
   async function beginRecording(triggeredByPeer) {
@@ -630,6 +568,8 @@
       dataConn.send('STOP_RECORD');
     }
 
+    // Let any in-flight onaudioprocess callback finish pushing its chunk
+    // before we read pcmChunks, so the last ~85ms of audio isn't dropped.
     setTimeout(() => {
       if (pcmChunks.length === 0) {
         setFooter('Recording was too short to save — try holding the take a little longer.');
