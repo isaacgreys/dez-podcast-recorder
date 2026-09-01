@@ -373,7 +373,6 @@
       showLoadFailure();
       return;
     }
-    hostUnavailableRetryUsed = false;
     if (peer) { peer.destroy(); peer = null; }
 
     peer = new Peer(roomCode, { debug: 0 });
@@ -576,6 +575,7 @@
       return;
     }
     roomCode = code;
+    hostUnavailableRetryUsed = false;
     const url = new URL(window.location.href);
     url.searchParams.set('room', roomCode);
     window.history.replaceState({}, '', url);
