@@ -316,8 +316,14 @@
   // 5. PeerJS — room-code based connect, reconnection, acked sync
   // =========================================================
 
+  function uniqueGuestPeerId() {
+    const stamp = Date.now().toString(36);
+    const salt = Math.random().toString(36).slice(2, 8);
+    return roomCode + '-guest-' + stamp + '-' + salt;
+  }
+
   function myFullPeerId() {
-    return isHost ? roomCode : (roomCode + '-guest');
+    return isHost ? roomCode : uniqueGuestPeerId();
   }
 
   function ensureRemoteAudioSafetyUi() {
@@ -414,7 +420,16 @@
     peer.on('disconnected', () => {
       setStatus('offline', 'RECONNECTING');
       setLcdStatus('RECONNECTING');
-      if (!peer.destroyed) peer.reconnect();
+      if (isHost) {
+        if (!peer.destroyed) peer.reconnect();
+        return;
+      }
+      if (reconnectTimer) return;
+      setFooter('Connection hiccup while joining — retrying guest link in a moment…');
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (roomCode && !peer.destroyed) connectToHost();
+      }, 1200);
     });
   }
 
@@ -426,6 +441,7 @@
     if (peer) { peer.destroy(); peer = null; }
     isHost = false;
     peer = new Peer(myFullPeerId(), { debug: 0 });
+    setFooter('Joining as guest from shared link…');
 
     peer.on('open', (id) => {
       reconnectAttempts = 0;
@@ -461,7 +477,12 @@
     });
     peer.on('disconnected', () => {
       setStatus('offline', 'RECONNECTING');
-      if (!peer.destroyed) peer.reconnect();
+      if (reconnectTimer) return;
+      setFooter('Guest connection dropped — retrying link to the room…');
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (roomCode && !peer.destroyed) connectToHost();
+      }, 1200);
     });
   }
 
@@ -741,7 +762,14 @@
   function waitForPeerLibThenJoin(attemptsLeft) {
     if (attemptsLeft === undefined) attemptsLeft = 20; // ~4s total
     if (typeof Peer !== 'undefined') {
-      joinRoom();
+      if (sharedRoom) {
+        roomCode = sharedRoom;
+        roomCodeField.value = sharedRoom;
+        setFooter('Joining as guest via shared link…');
+        becomeGuestAndConnect();
+      } else {
+        joinRoom();
+      }
       return;
     }
     if (attemptsLeft <= 0) {
