@@ -602,3 +602,21 @@ html,body{
   line-height: 1.4;
   text-align: center;
 }
+
+.headphone-banner{
+  max-width: 430px;
+  margin: 0 auto 14px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: #fff6e0;
+  border: 1px solid #d9a83a;
+  color: #5c4413;
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+#muteRemoteBtn{
+  margin: 4px 6px 6px;
+  width: calc(100% - 12px);
+}

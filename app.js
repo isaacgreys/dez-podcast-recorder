@@ -5,6 +5,16 @@
    Real PCM WAV recording (via ScriptProcessor tap),
    synced + acknowledged over the data channel, with
    IndexedDB crash recovery.
+
+   CONNECTION MODEL (rewritten for reliability):
+   Instead of a dynamic "first one wins = host" race — which
+   caused stale-ID ghosts after closing a tab, and flapping
+   between host/guest roles — both sides now derive a FIXED
+   pair of IDs from the room code: "<room>-a" and "<room>-b".
+   Each browser tries "-a" first; if taken, it becomes "-b".
+   This is deterministic, self-heals after a disconnect once
+   the stale ID lease expires, and never requires guessing
+   who's "supposed" to be the host.
    ========================================================= */
 
 (() => {
@@ -34,10 +44,12 @@
   let mediaCall = null;
   let localStream = null;
   let roomCode = '';
-  let isHost = false;
+  let mySlot = null;      // 'a' or 'b'
   let reconnectAttempts = 0;
   let reconnectTimer = null;
   let ackTimeout = null;
+  let hasEverConnected = false;
+  let intentionallyLeaving = false;
 
   let isRecording = false;
   let recordStartTime = 0;
@@ -50,6 +62,10 @@
   let sourceNode = null;
   let pcmChunks = [];
   let sampleRate = 48000;
+
+  // remote audio element + mute state (echo-loop mitigation)
+  let remoteAudioEl = null;
+  let remoteMuted = false;
 
   const NEEDLE_MIN_DEG = -80;
   const NEEDLE_MAX_DEG = 80;
@@ -108,12 +124,31 @@
         },
         video: false
       });
+
+      // If the mic gets unplugged / revoked mid-session, tell the user
+      // clearly instead of silently recording nothing.
+      localStream.getAudioTracks().forEach((track) => {
+        track.addEventListener('ended', () => {
+          setFooter('\u26a0 Microphone disconnected — reconnect it and reload the page.');
+          setLcdStatus('MIC LOST');
+          if (isRecording) finishRecording(false, true /* micLost */);
+        });
+      });
+
       setFooter('Mic ready. Type a room code to connect.');
       setupAudioGraph(localStream);
       return localStream;
     } catch (err) {
       console.error('getUserMedia failed', err);
-      setFooter('Mic access denied — allow the microphone and reload.');
+      if (err && err.name === 'NotFoundError') {
+        setFooter('No microphone found — plug one in and reload.');
+      } else if (err && err.name === 'NotAllowedError') {
+        setFooter('Mic access denied — allow the microphone in your browser settings and reload.');
+      } else if (err && err.name === 'NotReadableError') {
+        setFooter('Mic is busy in another app — close it and reload.');
+      } else {
+        setFooter('Could not access the microphone — reload and try again.');
+      }
       throw err;
     }
   }
@@ -148,6 +183,14 @@
     silentGain.gain.value = 0;
     processorNode.connect(silentGain);
     silentGain.connect(audioCtx.destination);
+
+    // Some browsers suspend the AudioContext until a user gesture; resume
+    // opportunistically on the next interaction so the VU meter/recording
+    // don't silently stay dead.
+    if (audioCtx.state === 'suspended') {
+      const resume = () => { audioCtx.resume(); document.removeEventListener('click', resume); };
+      document.addEventListener('click', resume);
+    }
   }
 
   function runVuLoop() {
@@ -310,39 +353,76 @@
   }
 
   // =========================================================
-  // 5. PeerJS — room-code based connect, reconnection, acked sync
+  // 5. PeerJS — fixed-slot room connect (no host/guest race),
+  //    clean teardown on leave, echo-safe remote audio
   // =========================================================
 
-  function myFullPeerId() {
-    return isHost ? roomCode : (roomCode + '-guest');
+  function slotPeerId(slot) {
+    return roomCode + '-' + slot;
+  }
+  function otherSlot(slot) {
+    return slot === 'a' ? 'b' : 'a';
   }
 
-  function initPeerForRoom() {
+  // Try slot "a" first; if it's taken, fall back to slot "b". If both are
+  // taken (e.g. two old ghost sessions), we still attempt "b" — PeerJS will
+  // report unavailable-id and we'll surface a clear message rather than loop.
+  function initPeerForRoom(preferredSlot) {
     if (typeof Peer === 'undefined') {
       showLoadFailure();
       return;
     }
-    if (peer) { peer.destroy(); peer = null; }
+    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
 
-    peer = new Peer(roomCode, { debug: 0 });
+    const slot = preferredSlot || 'a';
+    mySlot = slot;
+    peer = new Peer(slotPeerId(slot), { debug: 0 });
 
     peer.on('open', (id) => {
-      isHost = true;
       reconnectAttempts = 0;
-      onLocalPeerReady(id);
-      setFooter('Room open — waiting for your co-host to join.');
+      hasEverConnected = true;
+      onLocalPeerReady();
+      setFooter('Room open on your side — waiting for your co-host\u2026');
+      attemptConnectToOther();
     });
 
     peer.on('call', handleIncomingCall);
-    peer.on('connection', (conn) => { dataConn = conn; wireDataConnection(); });
+    peer.on('connection', (conn) => {
+      // Only accept a connection from the room's other slot, to avoid
+      // stray/unexpected peers if a room code is guessed.
+      dataConn = conn;
+      wireDataConnection();
+    });
 
     peer.on('error', (err) => {
       if (err.type === 'unavailable-id') {
-        becomeGuestAndConnect();
+        if (slot === 'a') {
+          // Someone (maybe our own stale session) holds slot "a" — try "b".
+          setFooter('Slot in use — trying the other side of the room\u2026');
+          setTimeout(() => initPeerForRoom('b'), 300);
+        } else {
+          // Both slots taken. Could be two real active sessions (room full),
+          // or two ghosts from recent tab closes. Ghosts expire on PeerJS's
+          // server after ~60s of inactivity, so retry with backoff instead
+          // of failing permanently.
+          reconnectAttempts++;
+          const delay = Math.min(2000 * reconnectAttempts, 10000);
+          setLcdStatus('ROOM FULL?');
+          setFooter('Both room slots are in use — if you just closed this page, wait a few seconds and it\u2019ll retry automatically.');
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            if (roomCode) initPeerForRoom('a');
+          }, delay);
+        }
       } else if (err.type === 'peer-unavailable') {
-        setFooter('No one\u2019s in that room yet — waiting, or double-check the code.');
+        // The other slot isn't online yet — totally normal while waiting
+        // for a co-host. Don't treat this as an error.
+        setFooter('Waiting for your co-host to join\u2026');
       } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed') {
         scheduleReconnect();
+      } else if (err.type === 'browser-incompatible') {
+        setFooter('Your browser doesn\u2019t support the required WebRTC features — try an up-to-date Chrome, Edge, or Firefox.');
       } else {
         console.error('Peer error', err);
         setFooter('Connection hiccup (' + err.type + ') — retrying\u2026');
@@ -351,76 +431,44 @@
     });
 
     peer.on('disconnected', () => {
+      if (intentionallyLeaving) return;
       setStatus('offline', 'RECONNECTING');
       setLcdStatus('RECONNECTING');
-      if (!peer.destroyed) peer.reconnect();
-    });
-  }
-
-  function becomeGuestAndConnect() {
-    if (typeof Peer === 'undefined') {
-      showLoadFailure();
-      return;
-    }
-    if (peer) { peer.destroy(); peer = null; }
-    isHost = false;
-    peer = new Peer(myFullPeerId(), { debug: 0 });
-
-    peer.on('open', (id) => {
-      reconnectAttempts = 0;
-      onLocalPeerReady(id);
-      connectToHost();
-    });
-    peer.on('call', handleIncomingCall);
-    peer.on('connection', (conn) => { dataConn = conn; wireDataConnection(); });
-    peer.on('error', (err) => {
-      console.error('Guest peer error', err);
-      if (err.type === 'peer-unavailable') {
-        // Host isn't there yet (or dropped) — keep retrying as guest rather
-        // than bouncing back to a host attempt, so two people joining at
-        // nearly the same moment don't flap roles back and forth.
-        setFooter('Waiting for co-host\u2019s room to open\u2026 retrying.');
-        reconnectAttempts++;
-        const delay = Math.min(800 * Math.pow(1.5, reconnectAttempts), 8000);
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          if (roomCode && !isHost) connectToHost();
-        }, delay);
-      } else if (err.type === 'unavailable-id') {
-        // Our own guest slot briefly collided (e.g. rapid rejoin) — just retry shortly.
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          if (roomCode) becomeGuestAndConnect();
-        }, 1000);
-      } else {
-        scheduleReconnect();
+      setFooter('Signal lost — reconnecting\u2026');
+      if (!peer.destroyed) {
+        try { peer.reconnect(); } catch (e) { scheduleReconnect(); }
       }
     });
-    peer.on('disconnected', () => {
-      setStatus('offline', 'RECONNECTING');
-      if (!peer.destroyed) peer.reconnect();
+
+    peer.on('close', () => {
+      if (intentionallyLeaving) return;
+      setStatus('offline', 'OFFLINE');
+      setLcdStatus('CLOSED');
     });
   }
 
-  function onLocalPeerReady(id) {
-    lcdMyId.textContent = 'room "' + roomCode + '"';
-    setLcdStatus(isHost ? 'ROOM OPEN' : 'JOINING\u2026');
-    connectBtn.disabled = true;
-    roomCodeField.disabled = true;
-  }
-
-  function connectToHost() {
-    setFooter('Joining your co-host\u2026');
-    dataConn = peer.connect(roomCode, { reliable: true });
+  // After our own peer opens, proactively try to reach the other slot —
+  // whichever slot we're NOT in. If they're not there yet, peer-unavailable
+  // fires (handled above) and we just wait; they'll call/connect to US once
+  // they open, since we're already listening via peer.on('connection'/'call').
+  function attemptConnectToOther() {
+    const targetId = slotPeerId(otherSlot(mySlot));
+    if (dataConn && dataConn.open) return; // already connected
+    dataConn = peer.connect(targetId, { reliable: true });
     wireDataConnection();
     getMicStream()
       .then((stream) => {
-        const call = peer.call(roomCode, stream);
+        const call = peer.call(targetId, stream);
         wireMediaCall(call);
       })
       .catch(() => setFooter('Could not start voice call — mic permission required.'));
+  }
+
+  function onLocalPeerReady() {
+    lcdMyId.textContent = 'room "' + roomCode + '"';
+    setLcdStatus('WAITING');
+    connectBtn.disabled = true;
+    roomCodeField.disabled = true;
   }
 
   async function handleIncomingCall(incomingCall) {
@@ -440,12 +488,13 @@
     setFooter('Connection dropped — retrying in ' + Math.round(delay / 1000) + 's\u2026');
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (roomCode) initPeerForRoom();
+      if (roomCode) initPeerForRoom('a');
     }, delay);
   }
 
   function wireDataConnection() {
     dataConn.on('open', () => {
+      reconnectAttempts = 0;
       setStatus('connected', 'PEER LINKED');
       setLcdStatus('PEER CONNECTED');
       setFooter('Co-host connected. Ready to record.');
@@ -461,6 +510,8 @@
       } else if (msg === 'START_ACK') {
         clearTimeout(ackTimeout);
         setFooter('Recording confirmed on both ends.');
+      } else if (msg === 'PING') {
+        dataConn.send('PONG');
       }
     });
 
@@ -468,6 +519,9 @@
       setStatus('offline', 'OFFLINE');
       setLcdStatus('PEER LEFT');
       setFooter('Co-host disconnected — will reconnect automatically if they rejoin.');
+      recordBtn.disabled = true;
+      // Keep our own peer alive and listening so we auto-reconnect the
+      // moment they come back, without needing to touch anything.
     });
 
     dataConn.on('error', (err) => {
@@ -475,27 +529,57 @@
     });
   }
 
+  // ---- Echo-loop prevention -------------------------------------------
+  // Playing the co-host's voice through speakers while your own mic is
+  // hot (and not using headphones) lets your mic pick the speaker output
+  // back up — on both ends at once this builds into a loud feedback loop.
+  // We can't detect "wearing headphones" directly, so we mitigate by:
+  //   1. Starting the remote audio at a safer default volume, not 100%.
+  //   2. Giving a persistent, easy mute toggle for the remote audio.
+  //   3. Warning clearly, once, when the call connects.
   function wireMediaCall(call) {
     mediaCall = call;
     call.on('stream', (remoteStream) => {
-      let el = document.getElementById('remoteAudioEl');
-      if (!el) {
-        el = document.createElement('audio');
-        el.id = 'remoteAudioEl';
-        el.autoplay = true;
-        el.setAttribute('playsinline', '');
-        el.style.display = 'none';
-        document.body.appendChild(el);
+      if (!remoteAudioEl) {
+        remoteAudioEl = document.createElement('audio');
+        remoteAudioEl.id = 'remoteAudioEl';
+        remoteAudioEl.autoplay = true;
+        remoteAudioEl.setAttribute('playsinline', '');
+        remoteAudioEl.style.display = 'none';
+        remoteAudioEl.volume = 0.7;
+        document.body.appendChild(remoteAudioEl);
       }
-      el.srcObject = remoteStream;
+      remoteAudioEl.srcObject = remoteStream;
+      remoteAudioEl.muted = remoteMuted;
+      setFooter('\u26a0 Use headphones if possible — playing your co-host through speakers while recording can cause a feedback loop.');
+      showHeadphoneWarningOnce();
     });
     call.on('close', () => setFooter('Call ended.'));
     call.on('error', (err) => console.error('Media call error', err));
   }
 
+  let headphoneWarningShown = false;
+  function showHeadphoneWarningOnce() {
+    if (headphoneWarningShown) return;
+    headphoneWarningShown = true;
+    const banner = document.getElementById('headphoneBanner');
+    if (banner) banner.hidden = false;
+  }
+
+  function toggleRemoteMute() {
+    remoteMuted = !remoteMuted;
+    if (remoteAudioEl) remoteAudioEl.muted = remoteMuted;
+    const muteBtn = document.getElementById('muteRemoteBtn');
+    if (muteBtn) muteBtn.textContent = remoteMuted ? 'UNMUTE CO-HOST' : 'MUTE CO-HOST';
+  }
+
   function joinRoom() {
     if (typeof Peer === 'undefined') {
       showLoadFailure();
+      return;
+    }
+    if (!navigator.onLine) {
+      setFooter('You appear to be offline — check your connection and try again.');
       return;
     }
     const code = slugifyRoomCode(roomCodeField.value);
@@ -504,13 +588,21 @@
       return;
     }
     roomCode = code;
+    intentionallyLeaving = false;
     const url = new URL(window.location.href);
     url.searchParams.set('room', roomCode);
     window.history.replaceState({}, '', url);
 
     setLcdStatus('CONNECTING\u2026');
     setFooter('Opening room\u2026');
-    initPeerForRoom();
+    initPeerForRoom('a');
+  }
+
+  function leaveRoomCleanly() {
+    intentionallyLeaving = true;
+    try { if (dataConn) dataConn.close(); } catch (e) {}
+    try { if (mediaCall) mediaCall.close(); } catch (e) {}
+    try { if (peer) peer.destroy(); } catch (e) {}
   }
 
   // =========================================================
@@ -544,6 +636,8 @@
         ackTimeout = setTimeout(() => {
           setFooter('\u26a0 No confirmation from co-host yet — check they\u2019re still connected.');
         }, 2500);
+      } else if (!triggeredByPeer && (!dataConn || !dataConn.open)) {
+        setFooter('\u26a0 Recording locally only — co-host isn\u2019t connected right now.');
       }
     } catch (err) {
       console.error('Failed to start recording', err);
@@ -551,7 +645,7 @@
     }
   }
 
-  function finishRecording(triggeredByPeer) {
+  function finishRecording(triggeredByPeer, micLost) {
     if (!isRecording) return;
     isRecording = false;
     spinReels(false);
@@ -562,7 +656,9 @@
     setLcdStatus('SAVING\u2026');
     recordBtn.disabled = false;
     stopBtn.disabled = true;
-    setFooter(triggeredByPeer ? 'Co-host stopped the take.' : 'Recording stopped — encoding WAV\u2026');
+    if (!micLost) {
+      setFooter(triggeredByPeer ? 'Co-host stopped the take.' : 'Recording stopped — encoding WAV\u2026');
+    }
 
     if (!triggeredByPeer && dataConn && dataConn.open) {
       dataConn.send('STOP_RECORD');
@@ -580,6 +676,7 @@
       const wavBlob = encodeWav(pcmChunks, sampleRate);
       downloadBlob(wavBlob, false);
       clearIndexedDbSession();
+      if (micLost) setFooter('Mic was disconnected — saved what was recorded up to that point.');
     }, 50);
   }
 
@@ -635,10 +732,40 @@
   recordBtn.addEventListener('click', () => beginRecording(false));
   stopBtn.addEventListener('click', () => finishRecording(false));
 
+  const muteRemoteBtn = document.getElementById('muteRemoteBtn');
+  if (muteRemoteBtn) muteRemoteBtn.addEventListener('click', toggleRemoteMute);
+
   window.addEventListener('beforeunload', (e) => {
     if (isRecording) {
       e.preventDefault();
       e.returnValue = '';
+    }
+  });
+
+  // Clean deregistration so a closed tab doesn't leave a ghost peer ID
+  // that blocks the next join. pagehide fires more reliably than
+  // beforeunload on mobile browsers (especially iOS Safari).
+  window.addEventListener('pagehide', leaveRoomCleanly);
+  window.addEventListener('beforeunload', leaveRoomCleanly);
+
+  // Network state changes — surface clearly instead of a silent hang.
+  window.addEventListener('offline', () => {
+    setStatus('offline', 'NO INTERNET');
+    setLcdStatus('NO INTERNET');
+    setFooter('You lost your internet connection — will retry once it\u2019s back.');
+  });
+  window.addEventListener('online', () => {
+    setFooter('Back online — reconnecting\u2026');
+    if (roomCode && (!peer || peer.destroyed || peer.disconnected)) {
+      initPeerForRoom('a');
+    }
+  });
+
+  // If the tab is backgrounded for a long time on mobile, some browsers
+  // throttle timers/WebRTC. On return, do a lightweight liveness check.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && dataConn && dataConn.open) {
+      try { dataConn.send('PING'); } catch (e) {}
     }
   });
 

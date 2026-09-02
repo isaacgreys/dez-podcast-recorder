@@ -20,6 +20,9 @@
 <div id="loadFailBanner" class="load-fail-banner" hidden role="alert">
   Couldn't load the connection library — check your internet connection or try disabling any ad/script blockers, then reload the page.
 </div>
+<div id="headphoneBanner" class="headphone-banner" hidden role="status">
+  \ud83c\udfa7 Use headphones if you can &mdash; playing your co-host through speakers while recording can cause a loud feedback loop.
+</div>
 <div class="room">
   <!-- ============ THE MACHINE ============ -->
   <main class="deck" role="application" aria-label="Dez podcast recorder">
@@ -124,6 +127,8 @@
         <span class="status-led__caption" id="statusLedCaption">OFFLINE</span>
       </div>
     </section>
+
+    <button id="muteRemoteBtn" class="btn-chip btn-chip--full" type="button">MUTE CO-HOST</button>
 
     <!-- ---------- Transport buttons ---------- -->
     <section class="transport">
