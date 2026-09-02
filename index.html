@@ -4,25 +4,11 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <meta name="theme-color" content="#f57f2a" />
-<title>Dez &mdash; Double-Ended Podcast Recorder</title>
+<title>Dez &mdash; Local Podcast Recorder</title>
 <link rel="stylesheet" href="styles.css" />
-<!-- PeerJS: handles WebRTC signaling + data channel for us.
-     Falls back to a second CDN if the first is blocked (ad blockers, some corporate firewalls). -->
-<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
-<script>
-  if (typeof Peer === 'undefined') {
-    document.write('<scr' + 'ipt src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></scr' + 'ipt>');
-  }
-</script>
 </head>
 <body>
 
-<div id="loadFailBanner" class="load-fail-banner" hidden role="alert">
-  Couldn't load the connection library — check your internet connection or try disabling any ad/script blockers, then reload the page.
-</div>
-<div id="headphoneBanner" class="headphone-banner" hidden role="status">
-  \ud83c\udfa7 Use headphones if you can &mdash; playing your co-host through speakers while recording can cause a loud feedback loop.
-</div>
 <div class="room">
   <!-- ============ THE MACHINE ============ -->
   <main class="deck" role="application" aria-label="Dez podcast recorder">
@@ -30,7 +16,7 @@
     <!-- Brand strip -->
     <header class="deck__brand">
       <span class="deck__brand-name">DEZ</span>
-      <span class="deck__brand-sub">double-ended field recorder</span>
+      <span class="deck__brand-sub">local field recorder</span>
     </header>
 
     <!-- ---------- Reels ---------- -->
@@ -68,24 +54,20 @@
         </div>
         <div class="lcd__row lcd__row--small">
           <span class="lcd__status" id="lcdStatus">STANDBY</span>
-          <span class="lcd__peer-id" id="lcdMyId">no room yet</span>
         </div>
       </div>
     </section>
 
-    <!-- ---------- Room code connect strip ---------- -->
-    <section class="connect-strip">
-      <div class="connect-strip__id">
-        <label for="roomCodeField" class="connect-strip__field-label">Room code (agree on one, use it every time)</label>
-        <div class="id-readout">
-          <input id="roomCodeField" type="text" placeholder="e.g. pals-jam-42" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Room code" />
-          <button id="shareLinkBtn" class="btn-chip" type="button" title="Copy a link your co-host can open to join instantly">SHARE LINK</button>
-        </div>
-      </div>
-
-      <div class="connect-strip__join">
-        <button id="connectBtn" class="btn-chip btn-chip--accent btn-chip--full" type="button">JOIN ROOM</button>
-      </div>
+    <!-- ---------- Sync helper ---------- -->
+    <section class="sync-strip">
+      <p class="sync-strip__hint">
+        Hop on a call with your co-host first (phone, Zoom, Discord &mdash; anything).
+        When you're both ready, hit Countdown &mdash; it plays a beep and flashes on
+        screen so you both press Record at the same instant.
+      </p>
+      <button id="countdownBtn" class="btn-chip btn-chip--accent btn-chip--full" type="button">
+        \u23f1 3&ndash;2&ndash;1 COUNTDOWN
+      </button>
     </section>
 
     <!-- ---------- VU meter + status LED ---------- -->
@@ -99,7 +81,6 @@
             </linearGradient>
           </defs>
           <path d="M 10 120 A 100 100 0 0 1 210 120" fill="url(#vuFaceGrad)" stroke="#3a2b22" stroke-width="2"/>
-          <!-- tick marks -->
           <g stroke="#3a2b22" stroke-width="1.5">
             <line x1="20" y1="118" x2="26" y2="108"/>
             <line x1="40" y1="90" x2="46" y2="82"/>
@@ -109,7 +90,6 @@
             <line x1="180" y1="90" x2="174" y2="82"/>
             <line x1="200" y1="118" x2="194" y2="108"/>
           </g>
-          <!-- red zone -->
           <path d="M 170 70 A 100 100 0 0 1 200 118" fill="none" stroke="#b5453f" stroke-width="6" opacity="0.55"/>
           <text x="18" y="132" font-size="9" fill="#5c4433" font-family="monospace">-20</text>
           <text x="104" y="42" font-size="9" fill="#5c4433" font-family="monospace">0</text>
@@ -124,17 +104,15 @@
         <div class="status-led" id="statusLed" data-state="offline">
           <span class="status-led__bulb"></span>
         </div>
-        <span class="status-led__caption" id="statusLedCaption">OFFLINE</span>
+        <span class="status-led__caption" id="statusLedCaption">MIC OFF</span>
       </div>
     </section>
-
-    <button id="muteRemoteBtn" class="btn-chip btn-chip--full" type="button">MUTE CO-HOST</button>
 
     <!-- ---------- Transport buttons ---------- -->
     <section class="transport">
       <button id="recordBtn" class="key key--record" type="button" disabled>
         <span class="key__icon key__icon--rec"></span>
-        <span class="key__label">Start Sync Record</span>
+        <span class="key__label">Start Recording</span>
       </button>
 
       <button id="stopBtn" class="key key--stop" type="button" disabled>
@@ -144,11 +122,15 @@
     </section>
 
     <footer class="deck__footer">
-      <span id="footerMsg">Type a room code you both know, then hit Join Room.</span>
+      <span id="footerMsg">Allow microphone access to begin.</span>
     </footer>
   </main>
 
-  <p class="room__note">Audio never leaves your two browsers except as a live voice call. Each side records and downloads its own local WAV track. First one to join opens the room — the second just joins the same code.</p>
+  <div id="countdownOverlay" class="countdown-overlay" hidden aria-live="assertive">
+    <span id="countdownNumber" class="countdown-overlay__number">3</span>
+  </div>
+
+  <p class="room__note">Everything happens on your device only &mdash; no server, no account, no data ever sent anywhere. Your recording downloads straight to your computer or phone.</p>
 </div>
 
 <script src="app.js"></script>

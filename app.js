@@ -1,20 +1,18 @@
 /* =========================================================
    DEZ — app.js
-   Room-code based PeerJS connection + WebRTC voice call
-   Web Audio API VU meter
-   Real PCM WAV recording (via ScriptProcessor tap),
-   synced + acknowledged over the data channel, with
-   IndexedDB crash recovery.
+   Fully local, single-device audio recorder. No networking,
+   no signaling server, no external services — nothing leaves
+   this browser. Two people run this independently on a call
+   (Zoom/Discord/phone) and use the on-screen 3-2-1 countdown
+   (with an audible beep) to start recording at the same
+   moment by eye/ear, then each downloads their own WAV file.
 
-   CONNECTION MODEL (rewritten for reliability):
-   Instead of a dynamic "first one wins = host" race — which
-   caused stale-ID ghosts after closing a tab, and flapping
-   between host/guest roles — both sides now derive a FIXED
-   pair of IDs from the room code: "<room>-a" and "<room>-b".
-   Each browser tries "-a" first; if taken, it becomes "-b".
-   This is deterministic, self-heals after a disconnect once
-   the stale ID lease expires, and never requires guessing
-   who's "supposed" to be the host.
+   Kept from the earlier version: Web Audio VU meter, real
+   16-bit PCM WAV export (hand-written header, no MediaRecorder
+   compression), and IndexedDB crash recovery.
+   Removed: PeerJS, WebRTC data/media channels, room codes —
+   all deleted, since they were the source of the connection
+   bugs and also the only thing that ever touched the network.
    ========================================================= */
 
 (() => {
@@ -23,14 +21,13 @@
   // ---------- DOM refs ----------
   const $ = (id) => document.getElementById(id);
 
-  const roomCodeField   = $('roomCodeField');
-  const shareLinkBtn    = $('shareLinkBtn');
-  const connectBtn      = $('connectBtn');
+  const countdownBtn    = $('countdownBtn');
+  const countdownOverlay= $('countdownOverlay');
+  const countdownNumber = $('countdownNumber');
   const recordBtn       = $('recordBtn');
   const stopBtn         = $('stopBtn');
   const timeDisplay     = $('timeDisplay');
   const lcdStatus       = $('lcdStatus');
-  const lcdMyId         = $('lcdMyId');
   const statusLed       = $('statusLed');
   const statusLedCaption= $('statusLedCaption');
   const vuNeedle        = $('vuNeedle');
@@ -39,17 +36,7 @@
   const footerMsg       = $('footerMsg');
 
   // ---------- State ----------
-  let peer = null;
-  let dataConn = null;
-  let mediaCall = null;
   let localStream = null;
-  let roomCode = '';
-  let mySlot = null;      // 'a' or 'b'
-  let reconnectAttempts = 0;
-  let reconnectTimer = null;
-  let ackTimeout = null;
-  let hasEverConnected = false;
-  let intentionallyLeaving = false;
 
   let isRecording = false;
   let recordStartTime = 0;
@@ -62,10 +49,6 @@
   let sourceNode = null;
   let pcmChunks = [];
   let sampleRate = 48000;
-
-  // remote audio element + mute state (echo-loop mitigation)
-  let remoteAudioEl = null;
-  let remoteMuted = false;
 
   const NEEDLE_MIN_DEG = -80;
   const NEEDLE_MAX_DEG = 80;
@@ -96,18 +79,6 @@
     reelRight.classList.toggle('is-spinning', spin);
   }
 
-  function showLoadFailure() {
-    const banner = document.getElementById('loadFailBanner');
-    if (banner) banner.hidden = false;
-    setLcdStatus('LOAD ERROR');
-    setFooter('Connection library failed to load — reload the page once you\u2019re back online.');
-    connectBtn.disabled = true;
-  }
-
-  function slugifyRoomCode(raw) {
-    return raw.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-  }
-
   // =========================================================
   // 1. Microphone capture
   // =========================================================
@@ -125,23 +96,27 @@
         video: false
       });
 
-      // If the mic gets unplugged / revoked mid-session, tell the user
-      // clearly instead of silently recording nothing.
       localStream.getAudioTracks().forEach((track) => {
         track.addEventListener('ended', () => {
           setFooter('\u26a0 Microphone disconnected — reconnect it and reload the page.');
           setLcdStatus('MIC LOST');
-          if (isRecording) finishRecording(false, true /* micLost */);
+          setStatus('offline', 'MIC LOST');
+          if (isRecording) finishRecording(true /* micLost */);
         });
       });
 
-      setFooter('Mic ready. Type a room code to connect.');
+      setStatus('connected', 'MIC READY');
+      setLcdStatus('READY');
+      setFooter('Mic ready. Hop on a call with your co-host, then hit Countdown when you\u2019re both set.');
+      recordBtn.disabled = false;
+      countdownBtn.disabled = false;
       setupAudioGraph(localStream);
       return localStream;
     } catch (err) {
       console.error('getUserMedia failed', err);
+      setStatus('offline', 'MIC ERROR');
       if (err && err.name === 'NotFoundError') {
-        setFooter('No microphone found — plug one in and reload.');
+        setFooter('No microphone found — plug one in and reload the page.');
       } else if (err && err.name === 'NotAllowedError') {
         setFooter('Mic access denied — allow the microphone in your browser settings and reload.');
       } else if (err && err.name === 'NotReadableError') {
@@ -184,9 +159,6 @@
     processorNode.connect(silentGain);
     silentGain.connect(audioCtx.destination);
 
-    // Some browsers suspend the AudioContext until a user gesture; resume
-    // opportunistically on the next interaction so the VU meter/recording
-    // don't silently stay dead.
     if (audioCtx.state === 'suspended') {
       const resume = () => { audioCtx.resume(); document.removeEventListener('click', resume); };
       document.addEventListener('click', resume);
@@ -353,269 +325,61 @@
   }
 
   // =========================================================
-  // 5. PeerJS — fixed-slot room connect (no host/guest race),
-  //    clean teardown on leave, echo-safe remote audio
+  // 5. Countdown + beep sync helper
+  //    Purely local: a visible 3-2-1 flash plus a short audible
+  //    beep via an OscillatorNode, so both people (already on a
+  //    voice call through some other app/phone) can start
+  //    recording at the same instant by eye/ear. No data of any
+  //    kind is sent anywhere — it's just UI + a tone.
   // =========================================================
 
-  function slotPeerId(slot) {
-    return roomCode + '-' + slot;
-  }
-  function otherSlot(slot) {
-    return slot === 'a' ? 'b' : 'a';
+  function beep(freq, durationMs) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = freq;
+    osc.type = 'sine';
+    gain.gain.value = 0.15;
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + durationMs / 1000);
   }
 
-  // Try slot "a" first; if it's taken, fall back to slot "b". If both are
-  // taken (e.g. two old ghost sessions), we still attempt "b" — PeerJS will
-  // report unavailable-id and we'll surface a clear message rather than loop.
-  function initPeerForRoom(preferredSlot) {
-    if (typeof Peer === 'undefined') {
-      showLoadFailure();
+  function runCountdown() {
+    if (!audioCtx) {
+      setFooter('Allow microphone access first — the countdown uses the same audio engine.');
       return;
     }
-    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+    countdownBtn.disabled = true;
+    countdownOverlay.hidden = false;
+    let count = 3;
+    countdownNumber.textContent = String(count);
+    beep(660, 150);
 
-    const slot = preferredSlot || 'a';
-    mySlot = slot;
-    peer = new Peer(slotPeerId(slot), { debug: 0 });
-
-    peer.on('open', (id) => {
-      reconnectAttempts = 0;
-      hasEverConnected = true;
-      onLocalPeerReady();
-      setFooter('Room open on your side — waiting for your co-host\u2026');
-      attemptConnectToOther();
-    });
-
-    peer.on('call', handleIncomingCall);
-    peer.on('connection', (conn) => {
-      // Only accept a connection from the room's other slot, to avoid
-      // stray/unexpected peers if a room code is guessed.
-      dataConn = conn;
-      wireDataConnection();
-    });
-
-    peer.on('error', (err) => {
-      if (err.type === 'unavailable-id') {
-        if (slot === 'a') {
-          // Someone (maybe our own stale session) holds slot "a" — try "b".
-          setFooter('Slot in use — trying the other side of the room\u2026');
-          setTimeout(() => initPeerForRoom('b'), 300);
-        } else {
-          // Both slots taken. Could be two real active sessions (room full),
-          // or two ghosts from recent tab closes. Ghosts expire on PeerJS's
-          // server after ~60s of inactivity, so retry with backoff instead
-          // of failing permanently.
-          reconnectAttempts++;
-          const delay = Math.min(2000 * reconnectAttempts, 10000);
-          setLcdStatus('ROOM FULL?');
-          setFooter('Both room slots are in use — if you just closed this page, wait a few seconds and it\u2019ll retry automatically.');
-          if (reconnectTimer) clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(() => {
-            reconnectTimer = null;
-            if (roomCode) initPeerForRoom('a');
-          }, delay);
-        }
-      } else if (err.type === 'peer-unavailable') {
-        // The other slot isn't online yet — totally normal while waiting
-        // for a co-host. Keep retrying periodically so we connect the
-        // moment they open the page, instead of giving up after one try.
-        setFooter('Waiting for your co-host to join\u2026');
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          if (roomCode && peer && !peer.destroyed) attemptConnectToOther();
-        }, 2000);
-      } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed') {
-        scheduleReconnect();
-      } else if (err.type === 'browser-incompatible') {
-        setFooter('Your browser doesn\u2019t support the required WebRTC features — try an up-to-date Chrome, Edge, or Firefox.');
+    const step = () => {
+      count--;
+      if (count > 0) {
+        countdownNumber.textContent = String(count);
+        beep(660, 150);
+        setTimeout(step, 1000);
       } else {
-        console.error('Peer error', err);
-        setFooter('Connection hiccup (' + err.type + ') — retrying\u2026');
-        scheduleReconnect();
+        countdownNumber.textContent = 'GO';
+        beep(990, 250);
+        setTimeout(() => {
+          countdownOverlay.hidden = true;
+          countdownBtn.disabled = false;
+        }, 600);
       }
-    });
-
-    peer.on('disconnected', () => {
-      if (intentionallyLeaving) return;
-      setStatus('offline', 'RECONNECTING');
-      setLcdStatus('RECONNECTING');
-      setFooter('Signal lost — reconnecting\u2026');
-      if (!peer.destroyed) {
-        try { peer.reconnect(); } catch (e) { scheduleReconnect(); }
-      }
-    });
-
-    peer.on('close', () => {
-      if (intentionallyLeaving) return;
-      setStatus('offline', 'OFFLINE');
-      setLcdStatus('CLOSED');
-    });
-  }
-
-  // After our own peer opens, proactively try to reach the other slot —
-  // whichever slot we're NOT in. If they're not there yet, peer-unavailable
-  // fires (handled above) and we just wait; they'll call/connect to US once
-  // they open, since we're already listening via peer.on('connection'/'call').
-  function attemptConnectToOther() {
-    const targetId = slotPeerId(otherSlot(mySlot));
-    if (dataConn && dataConn.open) return; // already connected
-    dataConn = peer.connect(targetId, { reliable: true });
-    wireDataConnection();
-    getMicStream()
-      .then((stream) => {
-        const call = peer.call(targetId, stream);
-        wireMediaCall(call);
-      })
-      .catch(() => setFooter('Could not start voice call — mic permission required.'));
-  }
-
-  function onLocalPeerReady() {
-    lcdMyId.textContent = 'room "' + roomCode + '"';
-    setLcdStatus('WAITING');
-    connectBtn.disabled = true;
-    roomCodeField.disabled = true;
-  }
-
-  async function handleIncomingCall(incomingCall) {
-    let stream;
-    try { stream = await getMicStream(); }
-    catch (e) { stream = new MediaStream(); }
-    incomingCall.answer(stream);
-    wireMediaCall(incomingCall);
-  }
-
-  function scheduleReconnect() {
-    if (reconnectTimer) return;
-    reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(1.6, reconnectAttempts), 15000);
-    setStatus('offline', 'RECONNECTING');
-    setLcdStatus('RECONNECTING');
-    setFooter('Connection dropped — retrying in ' + Math.round(delay / 1000) + 's\u2026');
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      if (roomCode) initPeerForRoom('a');
-    }, delay);
-  }
-
-  function wireDataConnection() {
-    dataConn.on('open', () => {
-      reconnectAttempts = 0;
-      setStatus('connected', 'PEER LINKED');
-      setLcdStatus('PEER CONNECTED');
-      setFooter('Co-host connected. Ready to record.');
-      recordBtn.disabled = false;
-    });
-
-    dataConn.on('data', (msg) => {
-      if (msg === 'START_RECORD') {
-        beginRecording(true);
-        dataConn.send('START_ACK');
-      } else if (msg === 'STOP_RECORD') {
-        finishRecording(true);
-      } else if (msg === 'START_ACK') {
-        clearTimeout(ackTimeout);
-        setFooter('Recording confirmed on both ends.');
-      } else if (msg === 'PING') {
-        dataConn.send('PONG');
-      }
-    });
-
-    dataConn.on('close', () => {
-      setStatus('offline', 'OFFLINE');
-      setLcdStatus('PEER LEFT');
-      setFooter('Co-host disconnected — will reconnect automatically if they rejoin.');
-      recordBtn.disabled = true;
-      // Keep our own peer alive and listening so we auto-reconnect the
-      // moment they come back, without needing to touch anything.
-    });
-
-    dataConn.on('error', (err) => {
-      console.warn('Data connection error', err);
-    });
-  }
-
-  // ---- Echo-loop prevention -------------------------------------------
-  // Playing the co-host's voice through speakers while your own mic is
-  // hot (and not using headphones) lets your mic pick the speaker output
-  // back up — on both ends at once this builds into a loud feedback loop.
-  // We can't detect "wearing headphones" directly, so we mitigate by:
-  //   1. Starting the remote audio at a safer default volume, not 100%.
-  //   2. Giving a persistent, easy mute toggle for the remote audio.
-  //   3. Warning clearly, once, when the call connects.
-  function wireMediaCall(call) {
-    mediaCall = call;
-    call.on('stream', (remoteStream) => {
-      if (!remoteAudioEl) {
-        remoteAudioEl = document.createElement('audio');
-        remoteAudioEl.id = 'remoteAudioEl';
-        remoteAudioEl.autoplay = true;
-        remoteAudioEl.setAttribute('playsinline', '');
-        remoteAudioEl.style.display = 'none';
-        remoteAudioEl.volume = 0.7;
-        document.body.appendChild(remoteAudioEl);
-      }
-      remoteAudioEl.srcObject = remoteStream;
-      remoteAudioEl.muted = remoteMuted;
-      setFooter('\u26a0 Use headphones if possible — playing your co-host through speakers while recording can cause a feedback loop.');
-      showHeadphoneWarningOnce();
-    });
-    call.on('close', () => setFooter('Call ended.'));
-    call.on('error', (err) => console.error('Media call error', err));
-  }
-
-  let headphoneWarningShown = false;
-  function showHeadphoneWarningOnce() {
-    if (headphoneWarningShown) return;
-    headphoneWarningShown = true;
-    const banner = document.getElementById('headphoneBanner');
-    if (banner) banner.hidden = false;
-  }
-
-  function toggleRemoteMute() {
-    remoteMuted = !remoteMuted;
-    if (remoteAudioEl) remoteAudioEl.muted = remoteMuted;
-    const muteBtn = document.getElementById('muteRemoteBtn');
-    if (muteBtn) muteBtn.textContent = remoteMuted ? 'UNMUTE CO-HOST' : 'MUTE CO-HOST';
-  }
-
-  function joinRoom() {
-    if (typeof Peer === 'undefined') {
-      showLoadFailure();
-      return;
-    }
-    if (!navigator.onLine) {
-      setFooter('You appear to be offline — check your connection and try again.');
-      return;
-    }
-    const code = slugifyRoomCode(roomCodeField.value);
-    if (!code) {
-      setFooter('Enter a room code first — anything you and your co-host both know.');
-      return;
-    }
-    roomCode = code;
-    intentionallyLeaving = false;
-    const url = new URL(window.location.href);
-    url.searchParams.set('room', roomCode);
-    window.history.replaceState({}, '', url);
-
-    setLcdStatus('CONNECTING\u2026');
-    setFooter('Opening room\u2026');
-    initPeerForRoom('a');
-  }
-
-  function leaveRoomCleanly() {
-    intentionallyLeaving = true;
-    try { if (dataConn) dataConn.close(); } catch (e) {}
-    try { if (mediaCall) mediaCall.close(); } catch (e) {}
-    try { if (peer) peer.destroy(); } catch (e) {}
+    };
+    setTimeout(step, 1000);
   }
 
   // =========================================================
-  // 6. Recording — real PCM capture, synced with ack + timeout warning
+  // 6. Recording — real PCM capture
   // =========================================================
 
-  async function beginRecording(triggeredByPeer) {
+  async function beginRecording() {
     if (isRecording) return;
     try {
       await getMicStream();
@@ -630,45 +394,30 @@
       setLcdStatus('RECORDING');
       recordBtn.disabled = true;
       stopBtn.disabled = false;
-      setFooter(triggeredByPeer ? 'Co-host started the take — recording locally.' : 'Recording\u2026 waiting for co-host confirmation.');
+      countdownBtn.disabled = true;
+      setFooter('Recording\u2026 hit Stop & Download when you\u2019re done.');
 
       timerInterval = setInterval(() => {
         timeDisplay.textContent = formatTime(Date.now() - recordStartTime);
       }, 250);
-
-      if (!triggeredByPeer && dataConn && dataConn.open) {
-        dataConn.send('START_RECORD');
-        clearTimeout(ackTimeout);
-        ackTimeout = setTimeout(() => {
-          setFooter('\u26a0 No confirmation from co-host yet — check they\u2019re still connected.');
-        }, 2500);
-      } else if (!triggeredByPeer && (!dataConn || !dataConn.open)) {
-        setFooter('\u26a0 Recording locally only — co-host isn\u2019t connected right now.');
-      }
     } catch (err) {
       console.error('Failed to start recording', err);
       setFooter('Could not start recording — check mic permissions.');
     }
   }
 
-  function finishRecording(triggeredByPeer, micLost) {
+  function finishRecording(micLost) {
     if (!isRecording) return;
     isRecording = false;
     spinReels(false);
     clearInterval(timerInterval);
-    clearTimeout(ackTimeout);
 
-    setStatus(dataConn && dataConn.open ? 'connected' : 'offline', dataConn && dataConn.open ? 'PEER LINKED' : 'OFFLINE');
+    setStatus('connected', 'MIC READY');
     setLcdStatus('SAVING\u2026');
     recordBtn.disabled = false;
     stopBtn.disabled = true;
-    if (!micLost) {
-      setFooter(triggeredByPeer ? 'Co-host stopped the take.' : 'Recording stopped — encoding WAV\u2026');
-    }
-
-    if (!triggeredByPeer && dataConn && dataConn.open) {
-      dataConn.send('STOP_RECORD');
-    }
+    countdownBtn.disabled = false;
+    if (!micLost) setFooter('Recording stopped — encoding WAV\u2026');
 
     // Let any in-flight onaudioprocess callback finish pushing its chunk
     // before we read pcmChunks, so the last ~85ms of audio isn't dropped.
@@ -711,35 +460,9 @@
   // Wire up UI events
   // =========================================================
 
-  shareLinkBtn.addEventListener('click', async () => {
-    const code = slugifyRoomCode(roomCodeField.value);
-    if (!code) {
-      setFooter('Type a room code first, then share the link.');
-      return;
-    }
-    const url = new URL(window.location.href);
-    url.searchParams.set('room', code);
-    try {
-      await navigator.clipboard.writeText(url.toString());
-      const original = shareLinkBtn.textContent;
-      shareLinkBtn.textContent = 'COPIED';
-      setTimeout(() => (shareLinkBtn.textContent = original), 1200);
-      setFooter('Link copied — send it to your co-host, they just tap it to join.');
-    } catch (e) {
-      setFooter('Copy this link: ' + url.toString());
-    }
-  });
-
-  connectBtn.addEventListener('click', joinRoom);
-  roomCodeField.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') joinRoom();
-  });
-
-  recordBtn.addEventListener('click', () => beginRecording(false));
+  countdownBtn.addEventListener('click', runCountdown);
+  recordBtn.addEventListener('click', beginRecording);
   stopBtn.addEventListener('click', () => finishRecording(false));
-
-  const muteRemoteBtn = document.getElementById('muteRemoteBtn');
-  if (muteRemoteBtn) muteRemoteBtn.addEventListener('click', toggleRemoteMute);
 
   window.addEventListener('beforeunload', (e) => {
     if (isRecording) {
@@ -748,63 +471,14 @@
     }
   });
 
-  // Clean deregistration so a closed tab doesn't leave a ghost peer ID
-  // that blocks the next join. pagehide fires more reliably than
-  // beforeunload on mobile browsers (especially iOS Safari).
-  window.addEventListener('pagehide', leaveRoomCleanly);
-  window.addEventListener('beforeunload', leaveRoomCleanly);
-
-  // Network state changes — surface clearly instead of a silent hang.
-  window.addEventListener('offline', () => {
-    setStatus('offline', 'NO INTERNET');
-    setLcdStatus('NO INTERNET');
-    setFooter('You lost your internet connection — will retry once it\u2019s back.');
-  });
-  window.addEventListener('online', () => {
-    setFooter('Back online — reconnecting\u2026');
-    if (roomCode && (!peer || peer.destroyed || peer.disconnected)) {
-      initPeerForRoom('a');
-    }
-  });
-
-  // If the tab is backgrounded for a long time on mobile, some browsers
-  // throttle timers/WebRTC. On return, do a lightweight liveness check.
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && dataConn && dataConn.open) {
-      try { dataConn.send('PING'); } catch (e) {}
-    }
-  });
-
   // =========================================================
   // Boot
   // =========================================================
 
-  setStatus('offline', 'OFFLINE');
+  setStatus('offline', 'MIC OFF');
   setLcdStatus('BOOTING\u2026');
+  countdownBtn.disabled = true;
   getMicStream().catch(() => {});
   checkForRecoverableSession();
-
-  const params = new URLSearchParams(window.location.search);
-  const sharedRoom = params.get('room');
-  if (sharedRoom) {
-    roomCodeField.value = sharedRoom;
-    setFooter('Room code loaded from link \u2014 joining automatically\u2026');
-    waitForPeerLibThenJoin();
-  } else {
-    setFooter('Type a room code you both know, then hit Join Room.');
-  }
-
-  function waitForPeerLibThenJoin(attemptsLeft) {
-    if (attemptsLeft === undefined) attemptsLeft = 20; // ~4s total
-    if (typeof Peer !== 'undefined') {
-      joinRoom();
-      return;
-    }
-    if (attemptsLeft <= 0) {
-      showLoadFailure();
-      return;
-    }
-    setTimeout(() => waitForPeerLibThenJoin(attemptsLeft - 1), 200);
-  }
 
 })();
