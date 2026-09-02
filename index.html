@@ -4,10 +4,20 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <meta name="theme-color" content="#f57f2a" />
-<title>Dez &mdash; Local Podcast Recorder</title>
+<title>Dez &mdash; Double-Ended Podcast Recorder</title>
 <link rel="stylesheet" href="styles.css" />
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<script>
+  if (typeof Peer === 'undefined') {
+    document.write('<scr' + 'ipt src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></scr' + 'ipt>');
+  }
+</script>
 </head>
 <body>
+
+<div id="loadFailBanner" class="load-fail-banner" hidden role="alert">
+  Couldn't load the connection library — check your internet connection or try disabling any ad/script blockers, then reload the page.
+</div>
 
 <div class="room">
   <!-- ============ THE MACHINE ============ -->
@@ -16,28 +26,27 @@
     <!-- Brand strip -->
     <header class="deck__brand">
       <span class="deck__brand-name">DEZ</span>
-      <span class="deck__brand-sub">local field recorder</span>
+      <span class="deck__brand-sub">double-ended field recorder</span>
     </header>
 
     <!-- ---------- Reels ---------- -->
     <section class="reels" aria-hidden="true">
       <div class="reel-well">
         <div class="reel" id="reelLeft">
-          <div class="reel__hub"></div>
+          <div class="reel__tape-body" id="tapeLeft"></div>
           <div class="reel__spokes"></div>
-          <div class="reel__tape" id="tapeLeft"></div>
+          <div class="reel__hub"></div>
         </div>
       </div>
 
       <div class="reel-well">
         <div class="reel" id="reelRight">
-          <div class="reel__hub"></div>
+          <div class="reel__tape-body reel__tape-body--sparse" id="tapeRight"></div>
           <div class="reel__spokes"></div>
-          <div class="reel__tape" id="tapeRight"></div>
+          <div class="reel__hub"></div>
         </div>
       </div>
 
-      <!-- tape path between reels, purely decorative -->
       <div class="tape-path"></div>
     </section>
 
@@ -54,20 +63,24 @@
         </div>
         <div class="lcd__row lcd__row--small">
           <span class="lcd__status" id="lcdStatus">STANDBY</span>
+          <span class="lcd__peer-id" id="lcdMyId">no room yet</span>
         </div>
       </div>
     </section>
 
-    <!-- ---------- Sync helper ---------- -->
-    <section class="sync-strip">
-      <p class="sync-strip__hint">
-        Hop on a call with your co-host first (phone, Zoom, Discord &mdash; anything).
-        When you're both ready, hit Countdown &mdash; it plays a beep and flashes on
-        screen so you both press Record at the same instant.
-      </p>
-      <button id="countdownBtn" class="btn-chip btn-chip--accent btn-chip--full" type="button">
-        \u23f1 3&ndash;2&ndash;1 COUNTDOWN
-      </button>
+    <!-- ---------- Room connect strip ---------- -->
+    <section class="connect-strip">
+      <div class="connect-strip__id">
+        <label for="roomCodeField" class="connect-strip__field-label">Room code (agree on one, use it every time)</label>
+        <div class="id-readout">
+          <input id="roomCodeField" type="text" placeholder="e.g. pals-jam-42" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Room code" />
+          <button id="shareLinkBtn" class="btn-chip" type="button" title="Copy a link your co-host can open to join instantly">SHARE LINK</button>
+        </div>
+      </div>
+
+      <div class="connect-strip__join">
+        <button id="connectBtn" class="btn-chip btn-chip--accent btn-chip--full" type="button">JOIN ROOM</button>
+      </div>
     </section>
 
     <!-- ---------- VU meter + status LED ---------- -->
@@ -76,26 +89,36 @@
         <svg viewBox="0 0 220 130" class="vu-meter__face" aria-hidden="true">
           <defs>
             <linearGradient id="vuFaceGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="#fdf6ee"/>
-              <stop offset="100%" stop-color="#ecdfc9"/>
+              <stop offset="0%" stop-color="#fffaf1"/>
+              <stop offset="100%" stop-color="#e8dcc4"/>
             </linearGradient>
+            <radialGradient id="vuGlow" cx="50%" cy="100%" r="75%">
+              <stop offset="0%" stop-color="#000" stop-opacity="0"/>
+              <stop offset="100%" stop-color="#000" stop-opacity="0.12"/>
+            </radialGradient>
           </defs>
-          <path d="M 10 120 A 100 100 0 0 1 210 120" fill="url(#vuFaceGrad)" stroke="#3a2b22" stroke-width="2"/>
+          <path d="M 10 120 A 100 100 0 0 1 210 120" fill="url(#vuFaceGrad)" stroke="#3a2b22" stroke-width="2.5"/>
+          <path d="M 10 120 A 100 100 0 0 1 210 120" fill="url(#vuGlow)"/>
           <g stroke="#3a2b22" stroke-width="1.5">
-            <line x1="20" y1="118" x2="26" y2="108"/>
-            <line x1="40" y1="90" x2="46" y2="82"/>
-            <line x1="70" y1="65" x2="74" y2="58"/>
+            <line x1="20" y1="118" x2="27" y2="107"/>
+            <line x1="34" y1="95" x2="40" y2="87"/>
+            <line x1="55" y1="76" x2="60" y2="70"/>
+            <line x1="80" y1="62" x2="83" y2="54"/>
             <line x1="110" y1="55" x2="110" y2="46"/>
-            <line x1="150" y1="65" x2="146" y2="58"/>
-            <line x1="180" y1="90" x2="174" y2="82"/>
-            <line x1="200" y1="118" x2="194" y2="108"/>
+            <line x1="140" y1="62" x2="137" y2="54"/>
+            <line x1="165" y1="76" x2="160" y2="70"/>
+            <line x1="186" y1="95" x2="180" y2="87"/>
+            <line x1="200" y1="118" x2="193" y2="107"/>
           </g>
-          <path d="M 170 70 A 100 100 0 0 1 200 118" fill="none" stroke="#b5453f" stroke-width="6" opacity="0.55"/>
-          <text x="18" y="132" font-size="9" fill="#5c4433" font-family="monospace">-20</text>
-          <text x="104" y="42" font-size="9" fill="#5c4433" font-family="monospace">0</text>
-          <text x="188" y="132" font-size="9" fill="#5c4433" font-family="monospace">+3</text>
-          <line id="vuNeedle" x1="110" y1="120" x2="110" y2="35" stroke="#a3181f" stroke-width="2.5" stroke-linecap="round" style="transform-origin: 110px 120px;"/>
-          <circle cx="110" cy="120" r="6" fill="#3a2b22"/>
+          <path d="M 158 61 A 100 100 0 0 1 200 118" fill="none" stroke="#b5453f" stroke-width="7" stroke-linecap="round" opacity="0.6"/>
+          <text x="14" y="132" font-size="8.5" fill="#5c4433" font-family="monospace">-20</text>
+          <text x="45" y="98" font-size="8" fill="#5c4433" font-family="monospace">-7</text>
+          <text x="105" y="42" font-size="8.5" fill="#5c4433" font-family="monospace">0</text>
+          <text x="165" y="98" font-size="8" fill="#5c4433" font-family="monospace">+3</text>
+          <text x="191" y="132" font-size="8.5" fill="#5c4433" font-family="monospace">+6</text>
+          <line id="vuNeedle" x1="110" y1="120" x2="110" y2="33" stroke="#a3181f" stroke-width="2.5" stroke-linecap="round" style="transform-origin: 110px 120px;"/>
+          <circle cx="110" cy="120" r="7" fill="#2b211a"/>
+          <circle cx="110" cy="120" r="3" fill="#4a3a2c"/>
         </svg>
         <span class="vu-meter__caption">VU</span>
       </div>
@@ -104,15 +127,22 @@
         <div class="status-led" id="statusLed" data-state="offline">
           <span class="status-led__bulb"></span>
         </div>
-        <span class="status-led__caption" id="statusLedCaption">MIC OFF</span>
+        <span class="status-led__caption" id="statusLedCaption">OFFLINE</span>
       </div>
     </section>
 
+    <button id="muteRemoteBtn" class="btn-chip btn-chip--full" type="button" hidden>MUTE CO-HOST</button>
+
     <!-- ---------- Transport buttons ---------- -->
     <section class="transport">
+      <button id="countdownBtn" class="key key--countdown" type="button" disabled>
+        <span class="key__icon">&#9200;</span>
+        <span class="key__label">3&ndash;2&ndash;1 Countdown</span>
+      </button>
+
       <button id="recordBtn" class="key key--record" type="button" disabled>
         <span class="key__icon key__icon--rec"></span>
-        <span class="key__label">Start Recording</span>
+        <span class="key__label">Start Sync Record</span>
       </button>
 
       <button id="stopBtn" class="key key--stop" type="button" disabled>
@@ -122,15 +152,16 @@
     </section>
 
     <footer class="deck__footer">
-      <span id="footerMsg">Allow microphone access to begin.</span>
+      <span id="footerMsg">Type a room code you both know, then hit Join Room.</span>
     </footer>
   </main>
 
-  <div id="countdownOverlay" class="countdown-overlay" hidden aria-live="assertive">
-    <span id="countdownNumber" class="countdown-overlay__number">3</span>
+  <!-- Small corner countdown badge, not a full-screen takeover -->
+  <div id="countdownBadge" class="countdown-badge" hidden aria-live="assertive">
+    <span id="countdownNumber" class="countdown-badge__number">3</span>
   </div>
 
-  <p class="room__note">Everything happens on your device only &mdash; no server, no account, no data ever sent anywhere. Your recording downloads straight to your computer or phone.</p>
+  <p class="room__note">Audio never leaves your two browsers except as a live voice call. Each side records and downloads its own local WAV track.</p>
 </div>
 
 <script src="app.js"></script>
