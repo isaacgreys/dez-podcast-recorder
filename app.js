@@ -417,8 +417,14 @@
         }
       } else if (err.type === 'peer-unavailable') {
         // The other slot isn't online yet — totally normal while waiting
-        // for a co-host. Don't treat this as an error.
+        // for a co-host. Keep retrying periodically so we connect the
+        // moment they open the page, instead of giving up after one try.
         setFooter('Waiting for your co-host to join\u2026');
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          if (roomCode && peer && !peer.destroyed) attemptConnectToOther();
+        }, 2000);
       } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed') {
         scheduleReconnect();
       } else if (err.type === 'browser-incompatible') {
